@@ -23,7 +23,7 @@ from googleapiclient.errors import HttpError
 # THRESHOLDS — what counts as a "real competitor"
 # ============================================================
 
-MIN_COMPETITOR_DURATION_SEC = 300    # 5 minutes
+MIN_COMPETITOR_DURATION_SEC = 180    # 3 minutes
 MIN_COMPETITOR_VIEWS = 50_000        # 50k views
 
 
@@ -168,8 +168,23 @@ st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-  html, body, [class*="css"], [class*="st-"] {
+  html, body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+
+  .stApp, .stApp p, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5,
+  .stApp label, .stApp button, .stApp input, .stApp textarea, .stApp select,
+  [data-testid="stMarkdownContainer"], [data-testid="stHeading"],
+  [data-testid="stCaptionContainer"], [data-testid="stExpander"] summary,
+  .stRadio label, .stCheckbox label {
       font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+  }
+
+  /* Preserve Material Symbols icon font so caret arrows etc. render correctly */
+  [class*="material-symbols"], [class*="material-icons"], .material-icons,
+  [data-testid="stExpander"] summary svg,
+  [data-testid="stExpander"] summary [class*="icon"] {
+      font-family: 'Material Symbols Rounded', 'Material Icons' !important;
   }
 
   .block-container {
@@ -303,7 +318,7 @@ def fetch_youtube_signals(player_name, api_key):
 
         if not video_ids:
             return {
-                "gap_score": 10, "comp_count": 0, "top_competitors": [],
+                "gap_score": 10, "comp_count": 0, "comp_total_views": 0, "top_competitors": [],
                 "demand_score": 1, "total_views_top10": 0,
             }
 
@@ -329,23 +344,40 @@ def fetch_youtube_signals(player_name, api_key):
         enriched.sort(key=lambda x: -x["views"])
 
         # === Content gap from substantial competitors ===
+        # Two-factor scoring: count + view dominance
         substantial = [
             v for v in enriched
             if v["duration_sec"] >= MIN_COMPETITOR_DURATION_SEC
             and v["views"] >= MIN_COMPETITOR_VIEWS
         ]
         comp_count = len(substantial)
+        comp_total_views = sum(v["views"] for v in substantial)
 
-        if comp_count == 0: gap_score = 10
-        elif comp_count == 1: gap_score = 9
-        elif comp_count == 2: gap_score = 8
-        elif comp_count <= 4: gap_score = 7
-        elif comp_count <= 7: gap_score = 6
-        elif comp_count <= 10: gap_score = 5
-        elif comp_count <= 15: gap_score = 4
-        elif comp_count <= 25: gap_score = 3
-        elif comp_count <= 40: gap_score = 2
-        else: gap_score = 1
+        # Factor 1: count of competitors
+        if comp_count == 0: count_score = 10
+        elif comp_count == 1: count_score = 9
+        elif comp_count == 2: count_score = 8
+        elif comp_count <= 4: count_score = 7
+        elif comp_count <= 7: count_score = 6
+        elif comp_count <= 10: count_score = 5
+        elif comp_count <= 15: count_score = 4
+        elif comp_count <= 25: count_score = 3
+        elif comp_count <= 40: count_score = 2
+        else: count_score = 1
+
+        # Factor 2: total views of competitors (how dominant they are)
+        if comp_total_views == 0: views_score = 10
+        elif comp_total_views < 200_000: views_score = 9
+        elif comp_total_views < 1_000_000: views_score = 8
+        elif comp_total_views < 5_000_000: views_score = 7
+        elif comp_total_views < 20_000_000: views_score = 6
+        elif comp_total_views < 50_000_000: views_score = 5
+        elif comp_total_views < 100_000_000: views_score = 4
+        elif comp_total_views < 250_000_000: views_score = 3
+        elif comp_total_views < 500_000_000: views_score = 2
+        else: views_score = 1
+
+        gap_score = round((count_score + views_score) / 2)
 
         # === Demand from top-10 view sum ===
         total_views_top10 = sum(v["views"] for v in enriched[:10])
@@ -359,6 +391,7 @@ def fetch_youtube_signals(player_name, api_key):
         return {
             "gap_score": gap_score,
             "comp_count": comp_count,
+            "comp_total_views": comp_total_views,
             "top_competitors": substantial[:5],
             "demand_score": demand_score,
             "total_views_top10": total_views_top10,
@@ -366,13 +399,13 @@ def fetch_youtube_signals(player_name, api_key):
     except HttpError as e:
         st.error(f"YouTube API error for {player_name}: {e}")
         return {
-            "gap_score": 5, "comp_count": -1, "top_competitors": [],
+            "gap_score": 5, "comp_count": -1, "comp_total_views": -1, "top_competitors": [],
             "demand_score": 5, "total_views_top10": -1,
         }
     except Exception as e:
         st.warning(f"Could not fetch YouTube data for {player_name}: {e}")
         return {
-            "gap_score": 5, "comp_count": -1, "top_competitors": [],
+            "gap_score": 5, "comp_count": -1, "comp_total_views": -1, "top_competitors": [],
             "demand_score": 5, "total_views_top10": -1,
         }
 
@@ -496,7 +529,7 @@ with st.expander("How this finds gaps — quick version"):
         """
 The picker targets a **demand-supply mismatch** — players people are actively searching for but who don't have enough quality content yet.
 
-- **Content gap** counts only *substantial competitors* on YouTube — videos that are 5+ minutes long AND have 50k+ views. A 30-second highlight clip doesn't compete with an animated bio; a 10-minute documentary does. Fewer real competitors = bigger gap.
+- **Content gap** counts *substantial competitors* on YouTube — videos that are 3+ minutes long AND have 50k+ views — and also weighs how dominant they are (combined views). Two competitors with 80k views each is a real gap; two competitors with 5M views each is not. The score combines both signals.
 - **Google Trends** pulls the last 30 days of search interest and detects rising momentum — FC Mobile drops, transfers, tournament moments, breaking news.
 - **YT demand** confirms there's actual viewing happening for the player.
 - **Story** and **skill** are your judgment calls.
@@ -580,6 +613,7 @@ if analyze_clicked and players_to_analyze:
             "scores": scores,
             "raw": {
                 "comp_count": yt["comp_count"],
+                "comp_total_views": yt["comp_total_views"],
                 "top_competitors": yt["top_competitors"],
                 "trend_pct": gt_pct,
                 "total_views_top10": yt["total_views_top10"],
@@ -641,7 +675,13 @@ if "results" in st.session_state:
             with col1:
                 st.markdown("**Auto-scored**")
                 if r["raw"]["comp_count"] >= 0:
-                    gap_detail = f"{r['raw']['comp_count']} substantial competitors"
+                    if r["raw"]["comp_count"] == 0:
+                        gap_detail = "0 substantial competitors"
+                    else:
+                        gap_detail = (
+                            f"{r['raw']['comp_count']} competitors · "
+                            f"{format_count(r['raw']['comp_total_views'])} combined views"
+                        )
                 else:
                     gap_detail = "(fetch failed)"
                 st.markdown(f"Content gap: **{r['scores']['contentGap']}/10**  \n_{gap_detail}_")
@@ -692,6 +732,7 @@ if "results" in st.session_state:
             "Story": r["scores"]["storyRichness"],
             "Skill": r["scores"]["skillTeachable"],
             "Real competitors": r["raw"]["comp_count"],
+            "Competitor views": r["raw"]["comp_total_views"],
             "Trend %": round(r["raw"]["trend_pct"], 1),
             "Top-10 YT views": r["raw"]["total_views_top10"],
         }
@@ -712,8 +753,12 @@ st.markdown('<div class="section-label">How the scoring works</div>', unsafe_all
 st.markdown(
     """
 **Content gap — 35% weight — auto-scored from YouTube**
-Searches YouTube for the player's exact name (using a quoted phrase for stricter matching) and counts only **substantial competitors** — videos that are at least 5 minutes long AND have at least 50,000 views. A 30-second highlight clip doesn't compete with an animated bio for search ranking. A 10-minute documentary with 200k views does. Fewer real competitors means a real demand-supply gap your video can fill.
-*Brackets: 0 competitors = 10/10, 1-2 = 8-9/10, 3-7 = 6-7/10, 8-15 = 4-5/10, 16+ = 1-3/10.*
+Searches YouTube for the player's exact name (using a quoted phrase for stricter matching) and identifies **substantial competitors** — videos that are at least 3 minutes long AND have at least 50,000 views. The gap score is calculated from two factors averaged together:
+
+- *Count* of substantial competitors. Fewer = bigger gap. (0 = 10/10, 1-2 = 8-9/10, 3-7 = 6-7/10, 8-15 = 4-5/10, 16+ = 1-3/10)
+- *Total combined views* of those competitors. Lower = bigger gap. Two videos with 80k views combined is barely competition; two videos with 5M views combined is real dominance.
+
+The two-factor approach prevents both false positives (a player with one massive viral bio scoring as a gap just because the count is low) and false negatives (a player with many weak competitors scoring as saturated when the actual competition is mediocre).
 
 **Google Trends — 30% weight — auto-scored from SerpAPI**
 Pulls the player's Google search interest over the **last 30 days**. Compares the most recent third of that window to the earliest third to detect rising or falling momentum. The short window captures fresh signals — FC Mobile releases, recent transfers, tournament moments, breaking news — instead of slower long-term trends.
