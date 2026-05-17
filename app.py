@@ -6,15 +6,14 @@ based on YouTube content gap, Google Trends momentum, and YouTube search demand.
 Manual overrides available for story richness and teachable skill.
 """
 
-import math
 import time
 from datetime import datetime
 
 import pandas as pd
+import requests
 import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from pytrends.request import TrendReq
 
 # ============================================================
 # CONFIG
@@ -44,15 +43,12 @@ LABELS = {
 
 
 # ============================================================
-# SCORING FUNCTIONS (auto-fetch from APIs)
+# SCORING FUNCTIONS
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_content_gap(player_name: str, api_key: str):
-    """
-    Count animated biography videos already on YouTube for this player.
-    Fewer existing videos = bigger content gap = higher score.
-    """
+    """Count animated biography videos on YouTube. Fewer = bigger gap."""
     try:
         youtube = build("youtube", "v3", developerKey=api_key)
         query = f"animated {player_name} biography story"
@@ -61,7 +57,6 @@ def fetch_content_gap(player_name: str, api_key: str):
         ).execute()
         count = len(response.get("items", []))
 
-        # 0 results = 10, 9+ = 1
         if count <= 0:
             score = 10
         elif count >= 9:
@@ -80,10 +75,7 @@ def fetch_content_gap(player_name: str, api_key: str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_youtube_demand(player_name: str, api_key: str):
-    """
-    Total view counts of the top 10 results when searching for the player's name.
-    More views = stronger search demand.
-    """
+    """Total view counts of top 10 YouTube results. More views = stronger demand."""
     try:
         youtube = build("youtube", "v3", developerKey=api_key)
         search = youtube.search().list(
@@ -94,7 +86,13 @@ def fetch_youtube_demand(player_name: str, api_key: str):
             order="relevance",
         ).execute()
 
-        video_ids = [item["id"]["videoId"] for item in search.get("items", [])]
+        # Safely extract video IDs (some items may be missing videoId)
+        video_ids = []
+        for item in search.get("items", []):
+            id_obj = item.get("id", {})
+            if isinstance(id_obj, dict) and id_obj.get("videoId"):
+                video_ids.append(id_obj["videoId"])
+
         if not video_ids:
             return 1, 0
 
@@ -106,7 +104,6 @@ def fetch_youtube_demand(player_name: str, api_key: str):
             for v in stats.get("items", [])
         )
 
-        # Log-scale bucketing
         if total_views < 10_000:
             score = 1
         elif total_views < 100_000:
@@ -130,38 +127,51 @@ def fetch_youtube_demand(player_name: str, api_key: str):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_google_trends(player_name: str):
+def fetch_google_trends(player_name: str, serpapi_key: str):
     """
-    Compare last third vs first third of 90 days of Google search interest.
-    Rising slope = higher score.
+    Use SerpAPI to fetch Google Trends data.
+    Compares last third vs first third of 90 days to detect rising interest.
     """
+    if not serpapi_key:
+        return 5, 0.0
+
     try:
-        pytrends = TrendReq(hl="en-US", tz=360, timeout=(10, 25), retries=2, backoff_factor=0.5)
-        pytrends.build_payload(
-            kw_list=[player_name],
-            cat=0,
-            timeframe="today 3-m",
-            geo="",
-            gprop="",
-        )
-        df = pytrends.interest_over_time()
-        if df.empty or player_name not in df.columns:
+        url = "https://serpapi.com/search"
+        params = {
+            "engine": "google_trends",
+            "q": player_name,
+            "data_type": "TIMESERIES",
+            "date": "today 3-m",
+            "api_key": serpapi_key,
+        }
+        response = requests.get(url, params=params, timeout=25)
+        response.raise_for_status()
+        data = response.json()
+
+        timeline = data.get("interest_over_time", {}).get("timeline_data", [])
+        if not timeline:
             return 5, 0.0
 
-        values = df[player_name].values
+        values = []
+        for point in timeline:
+            vals = point.get("values", [])
+            if vals and isinstance(vals, list):
+                v = vals[0].get("extracted_value")
+                if v is not None:
+                    values.append(v)
+
         if len(values) < 4:
             return 5, 0.0
 
         third = max(1, len(values) // 3)
-        first = values[:third].mean()
-        last = values[-third:].mean()
+        first = sum(values[:third]) / third
+        last = sum(values[-third:]) / third
 
         if first <= 0:
             first = 1
 
         pct_change = (last - first) / first * 100
 
-        # Bucketed score
         if pct_change >= 100:
             score = 10
         elif pct_change >= 50:
@@ -184,8 +194,8 @@ def fetch_google_trends(player_name: str):
         return score, pct_change
     except Exception as e:
         st.warning(
-            f"Google Trends unavailable for {player_name} (rate-limited or blocked). "
-            f"Defaulting to score 5. Error: {type(e).__name__}"
+            f"Google Trends fetch failed for {player_name}: {type(e).__name__}. "
+            f"Defaulting to 5."
         )
         return 5, 0.0
 
@@ -238,7 +248,7 @@ st.caption(
     "Google Trends momentum, and search demand. Story and skill scores are manual."
 )
 
-# --- API key check ---
+# --- API key checks ---
 try:
     api_key = st.secrets["YOUTUBE_API_KEY"]
 except (KeyError, FileNotFoundError):
@@ -247,6 +257,15 @@ except (KeyError, FileNotFoundError):
         "Add `YOUTUBE_API_KEY` under Settings → Secrets in Streamlit Cloud."
     )
     st.stop()
+
+try:
+    serpapi_key = st.secrets["SERPAPI_KEY"]
+except (KeyError, FileNotFoundError):
+    serpapi_key = None
+    st.warning(
+        "⚠️ SerpAPI key not set. Google Trends will default to 5 for all players. "
+        "Sign up free at serpapi.com and add `SERPAPI_KEY` to Streamlit secrets."
+    )
 
 # --- Weight display ---
 with st.expander("How scoring works"):
@@ -293,16 +312,16 @@ if analyze:
         progress.progress(i / len(players), text=f"Analyzing {name}...")
 
         cg_score, cg_count = fetch_content_gap(name, api_key)
-        gt_score, gt_pct = fetch_google_trends(name)
+        gt_score, gt_pct = fetch_google_trends(name, serpapi_key)
         yd_score, yd_views = fetch_youtube_demand(name, api_key)
 
-        time.sleep(0.3)  # be polite to APIs
+        time.sleep(0.3)
 
         scores = {
             "contentGap": cg_score,
             "googleTrends": gt_score,
             "ytSearchDemand": yd_score,
-            "storyRichness": 7,  # default — user can override
+            "storyRichness": 7,
             "skillTeachable": 7,
         }
         results.append({
@@ -326,7 +345,6 @@ if analyze:
 if "results" in st.session_state:
     results = st.session_state["results"]
 
-    # Apply any slider overrides from session state, then compute totals
     for i, r in enumerate(results):
         story_key = f"story_{i}"
         skill_key = f"skill_{i}"
@@ -340,7 +358,6 @@ if "results" in st.session_state:
     winner = ranked[0]
     runner_up = ranked[1] if len(ranked) > 1 else None
 
-    # Winner card
     st.divider()
     st.markdown("### 🏆 This week's pick")
     col1, col2 = st.columns([3, 1])
@@ -352,7 +369,6 @@ if "results" in st.session_state:
     st.info(generate_reason(winner["name"], winner["scores"], runner_up))
     st.caption(f"Analyzed at {st.session_state.get('analyzed_at', 'unknown time')}")
 
-    # Manual override sliders
     st.divider()
     st.subheader("Fine-tune story & skill scores")
     st.caption(
@@ -383,7 +399,6 @@ if "results" in st.session_state:
                 st.write(f"YT demand: **{r['scores']['ytSearchDemand']}/10**  {views_detail}")
             with col2:
                 st.markdown("**Your manual scores**")
-                # Find original index in results list (sorting changes order)
                 original_idx = results.index(r)
                 st.slider(
                     "Story richness",
@@ -398,7 +413,6 @@ if "results" in st.session_state:
                     key=f"skill_{original_idx}",
                 )
 
-    # Full table + export
     st.divider()
     st.subheader("Full rankings")
     df = pd.DataFrame([
