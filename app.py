@@ -1,13 +1,14 @@
 """
-Soccer Player Picker v4
-- Content gap now counts SUBSTANTIAL competitors (5+ min, 50k+ views) — actual rivals
-  for an animated bio, not 30-second clips
-- Combined YouTube call halves API quota cost
-- Modern UI with custom CSS, polished winner card, category badges
-- Suggest mode samples players from curated pools
-- Manual mode accepts player names
+Soccer Player Picker v5
+- A+B+C player pool management:
+  * Manual add UI in sidebar
+  * Wikipedia bulk pull (Ballon d'Or winners preset)
+  * SerpAPI News + Claude name extraction for rising-star discovery
+- Persistent Google Sheets storage (shared across team)
+- All previous features: gap scoring with two factors, 30-day trends, modern UI
 """
 
+import json
 import random
 import re
 import time
@@ -19,19 +20,33 @@ import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# Optional imports — features degrade gracefully if not installed
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSPREAD_AVAILABLE = True
+except ImportError:
+    GSPREAD_AVAILABLE = False
+
+try:
+    from anthropic import Anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
 # ============================================================
-# THRESHOLDS — what counts as a "real competitor"
+# THRESHOLDS
 # ============================================================
 
-MIN_COMPETITOR_DURATION_SEC = 180    # 3 minutes
-MIN_COMPETITOR_VIEWS = 50_000        # 50k views
+MIN_COMPETITOR_DURATION_SEC = 180
+MIN_COMPETITOR_VIEWS = 50_000
 
 
 # ============================================================
-# PLAYER POOLS
+# DEFAULT PLAYER POOLS (always available, augmented by Sheet)
 # ============================================================
 
-ICONIC_PLAYERS = [
+DEFAULT_ICONIC = [
     "Zinedine Zidane", "Ronaldinho", "Ronaldo Nazario", "Roberto Carlos",
     "Cafu", "Roberto Baggio", "Andrea Pirlo", "Paolo Maldini", "Franco Baresi",
     "Gianluigi Buffon", "Fabio Cannavaro", "Alessandro Del Piero",
@@ -51,7 +66,7 @@ ICONIC_PLAYERS = [
     "Marta", "Mia Hamm", "Abby Wambach", "Homare Sawa",
 ]
 
-RISING_STARS = [
+DEFAULT_RISING = [
     "Lamine Yamal", "Pau Cubarsi", "Arda Guler", "Kenan Yildiz",
     "Endrick", "Estevao Willian", "Vitor Roque",
     "Desire Doue", "Bradley Barcola", "Warren Zaire-Emery",
@@ -66,7 +81,7 @@ RISING_STARS = [
     "Linda Caicedo", "Lena Oberdorf", "Catarina Macario", "Naomi Girma",
 ]
 
-ACTIVE_STARS = [
+DEFAULT_ACTIVE = [
     "Erling Haaland", "Vinicius Junior", "Rodrygo", "Raphinha",
     "Bukayo Saka", "Martin Odegaard", "Declan Rice", "Phil Foden",
     "Jude Bellingham",
@@ -83,9 +98,7 @@ ACTIVE_STARS = [
     "Mary Earps", "Lucy Bronze", "Lauren James", "Asisat Oshoala",
 ]
 
-CATEGORY_MAP = {p: "Iconic retired" for p in ICONIC_PLAYERS}
-CATEGORY_MAP.update({p: "Rising star" for p in RISING_STARS})
-CATEGORY_MAP.update({p: "Active star" for p in ACTIVE_STARS})
+CATEGORIES = ["Iconic retired", "Rising star", "Active star"]
 
 CATEGORY_STYLES = {
     "Iconic retired": ("#FEF3C7", "#92400E"),
@@ -93,48 +106,6 @@ CATEGORY_STYLES = {
     "Active star":    ("#DBEAFE", "#1E40AF"),
     "Custom":         ("#F1F5F9", "#475569"),
 }
-
-
-def get_category(name):
-    return CATEGORY_MAP.get(name, "Custom")
-
-
-def category_badge_html(category):
-    bg, fg = CATEGORY_STYLES.get(category, CATEGORY_STYLES["Custom"])
-    return (
-        f'<span style="display:inline-block;padding:4px 12px;border-radius:9999px;'
-        f'font-size:12px;font-weight:600;background:{bg};color:{fg};">{category}</span>'
-    )
-
-
-def suggest_players(num_icons, num_rising, num_active, exclude):
-    icons = [p for p in ICONIC_PLAYERS if p not in exclude]
-    rising = [p for p in RISING_STARS if p not in exclude]
-    active = [p for p in ACTIVE_STARS if p not in exclude]
-    selection = []
-    selection += random.sample(icons, min(num_icons, len(icons)))
-    selection += random.sample(rising, min(num_rising, len(rising)))
-    selection += random.sample(active, min(num_active, len(active)))
-    return selection
-
-
-def format_count(n):
-    if n < 1000: return f"{n:,}"
-    if n < 1_000_000: return f"{n / 1000:.1f}k".replace(".0k", "k")
-    return f"{n / 1_000_000:.1f}M".replace(".0M", "M")
-
-
-def parse_iso_duration(iso_str):
-    """Convert YouTube's ISO 8601 duration (e.g. 'PT5M30S') to seconds."""
-    if not iso_str or not iso_str.startswith('PT'):
-        return 0
-    m = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', iso_str)
-    if not m:
-        return 0
-    h = int(m.group(1) or 0)
-    mn = int(m.group(2) or 0)
-    s = int(m.group(3) or 0)
-    return h * 3600 + mn * 60 + s
 
 
 # ============================================================
@@ -145,14 +116,13 @@ st.set_page_config(
     page_title="Soccer Player Picker",
     page_icon="⚽",
     layout="centered",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 WEIGHTS = {
     "contentGap": 0.35, "googleTrends": 0.30, "ytSearchDemand": 0.15,
     "storyRichness": 0.10, "skillTeachable": 0.10,
 }
-
 LABELS = {
     "contentGap": "Content gap", "googleTrends": "Google Trends",
     "ytSearchDemand": "YT demand", "storyRichness": "Story richness",
@@ -161,17 +131,14 @@ LABELS = {
 
 
 # ============================================================
-# CUSTOM CSS
+# CSS
 # ============================================================
 
 st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-  html, body {
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-  }
-
+  html, body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
   .stApp, .stApp p, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5,
   .stApp label, .stApp button, .stApp input, .stApp textarea, .stApp select,
   [data-testid="stMarkdownContainer"], [data-testid="stHeading"],
@@ -179,20 +146,13 @@ st.markdown("""
   .stRadio label, .stCheckbox label {
       font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
   }
-
-  /* Preserve Material Symbols icon font so caret arrows etc. render correctly */
   [class*="material-symbols"], [class*="material-icons"], .material-icons,
   [data-testid="stExpander"] summary svg,
   [data-testid="stExpander"] summary [class*="icon"] {
       font-family: 'Material Symbols Rounded', 'Material Icons' !important;
   }
 
-  .block-container {
-      padding-top: 2.5rem !important;
-      padding-bottom: 5rem !important;
-      max-width: 880px !important;
-  }
-
+  .block-container { padding-top: 2.5rem !important; padding-bottom: 5rem !important; max-width: 880px !important; }
   #MainMenu, footer, header[data-testid="stHeader"] { display: none !important; }
 
   h1 { font-weight: 700 !important; letter-spacing: -0.025em !important; font-size: 2.25rem !important; }
@@ -200,12 +160,9 @@ st.markdown("""
   h3 { font-weight: 600 !important; letter-spacing: -0.015em !important; }
 
   .stButton > button {
-      border-radius: 10px !important;
-      font-weight: 600 !important;
-      padding: 0.65rem 1.5rem !important;
-      border: 1px solid #E2E8F0 !important;
-      transition: all 0.15s ease !important;
-      box-shadow: none !important;
+      border-radius: 10px !important; font-weight: 600 !important;
+      padding: 0.65rem 1.5rem !important; border: 1px solid #E2E8F0 !important;
+      transition: all 0.15s ease !important; box-shadow: none !important;
   }
   .stButton > button:hover { border-color: #CBD5E1 !important; background: #F8FAFC !important; }
   .stButton > button[kind="primary"] {
@@ -215,8 +172,7 @@ st.markdown("""
   }
   .stButton > button[kind="primary"]:hover {
       background: #059669 !important; border-color: #059669 !important;
-      transform: translateY(-1px);
-      box-shadow: 0 6px 16px rgba(16, 185, 129, 0.3) !important;
+      transform: translateY(-1px); box-shadow: 0 6px 16px rgba(16, 185, 129, 0.3) !important;
   }
 
   div[data-testid="stExpander"] {
@@ -235,9 +191,7 @@ st.markdown("""
       font-size: 0.7rem !important; text-transform: uppercase;
       letter-spacing: 0.05em; font-weight: 600 !important; color: #64748B !important;
   }
-  div[data-testid="stMetricValue"] {
-      font-size: 1.5rem !important; font-weight: 700 !important; color: #0F172A !important;
-  }
+  div[data-testid="stMetricValue"] { font-size: 1.5rem !important; font-weight: 700 !important; color: #0F172A !important; }
 
   input, textarea { border-radius: 8px !important; border: 1px solid #E2E8F0 !important; }
   input:focus, textarea:focus {
@@ -275,85 +229,319 @@ st.markdown("""
       font-weight: 700; color: #64748B; margin-bottom: 0.4rem;
   }
 
-  .video-item {
-      font-size: 0.85rem; color: #334155;
-      padding: 6px 0; border-bottom: 1px solid #F1F5F9;
-      line-height: 1.4;
-  }
+  .video-item { font-size: 0.85rem; color: #334155; padding: 6px 0; border-bottom: 1px solid #F1F5F9; line-height: 1.4; }
   .video-meta { color: #94A3B8; font-size: 0.75rem; font-weight: 500; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ============================================================
-# YOUTUBE — combined gap + demand in one search
+# HELPERS
+# ============================================================
+
+def format_count(n):
+    if n < 1000: return f"{n:,}"
+    if n < 1_000_000: return f"{n / 1000:.1f}k".replace(".0k", "k")
+    return f"{n / 1_000_000:.1f}M".replace(".0M", "M")
+
+
+def parse_iso_duration(iso_str):
+    if not iso_str or not iso_str.startswith('PT'):
+        return 0
+    m = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', iso_str)
+    if not m:
+        return 0
+    h = int(m.group(1) or 0)
+    mn = int(m.group(2) or 0)
+    s = int(m.group(3) or 0)
+    return h * 3600 + mn * 60 + s
+
+
+def category_badge_html(category):
+    bg, fg = CATEGORY_STYLES.get(category, CATEGORY_STYLES["Custom"])
+    return (
+        f'<span style="display:inline-block;padding:4px 12px;border-radius:9999px;'
+        f'font-size:12px;font-weight:600;background:{bg};color:{fg};">{category}</span>'
+    )
+
+
+# ============================================================
+# GOOGLE SHEETS PERSISTENCE
+# ============================================================
+
+def get_sheet():
+    """Connect to the Google Sheet (cached)."""
+    if not GSPREAD_AVAILABLE:
+        return None
+    if "GCP_SERVICE_ACCOUNT" not in st.secrets or "SHEET_NAME" not in st.secrets:
+        return None
+    try:
+        creds_dict = json.loads(st.secrets["GCP_SERVICE_ACCOUNT"]) if isinstance(st.secrets["GCP_SERVICE_ACCOUNT"], str) else dict(st.secrets["GCP_SERVICE_ACCOUNT"])
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sheet = gc.open(st.secrets["SHEET_NAME"]).sheet1
+
+        # Ensure headers exist
+        try:
+            headers = sheet.row_values(1)
+            if not headers:
+                sheet.update("A1:D1", [["name", "category", "source", "added_at"]])
+        except Exception:
+            sheet.update("A1:D1", [["name", "category", "source", "added_at"]])
+
+        return sheet
+    except Exception as e:
+        st.sidebar.error(f"Sheet connection failed: {type(e).__name__}")
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_sheet_players():
+    """Load all players from the Sheet. Returns list of dicts."""
+    sheet = get_sheet()
+    if sheet is None:
+        return []
+    try:
+        records = sheet.get_all_records()
+        return [r for r in records if r.get("name")]
+    except Exception:
+        return []
+
+
+def add_players_to_sheet(new_players, source):
+    """Add multiple players. new_players is list of (name, category) tuples."""
+    sheet = get_sheet()
+    if sheet is None:
+        return 0, "Sheets not configured."
+    try:
+        existing = {r["name"].lower() for r in sheet.get_all_records() if r.get("name")}
+        default_all = {p.lower() for p in (DEFAULT_ICONIC + DEFAULT_RISING + DEFAULT_ACTIVE)}
+
+        rows_to_add = []
+        added_count = 0
+        for name, category in new_players:
+            name_clean = name.strip()
+            if not name_clean:
+                continue
+            if name_clean.lower() in existing or name_clean.lower() in default_all:
+                continue
+            rows_to_add.append([
+                name_clean, category, source,
+                datetime.now().strftime("%Y-%m-%d %H:%M"),
+            ])
+            existing.add(name_clean.lower())
+            added_count += 1
+
+        if rows_to_add:
+            sheet.append_rows(rows_to_add)
+        load_sheet_players.clear()  # invalidate cache
+        return added_count, None
+    except Exception as e:
+        return 0, f"{type(e).__name__}: {e}"
+
+
+def remove_player_from_sheet(player_name):
+    sheet = get_sheet()
+    if sheet is None:
+        return False
+    try:
+        records = sheet.get_all_records()
+        for i, r in enumerate(records, start=2):
+            if r.get("name") == player_name:
+                sheet.delete_rows(i)
+                load_sheet_players.clear()
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def get_combined_pools():
+    """
+    Combine default pools + Sheet additions.
+    Returns dict mapping category -> list of player names.
+    """
+    pools = {
+        "Iconic retired": list(DEFAULT_ICONIC),
+        "Rising star": list(DEFAULT_RISING),
+        "Active star": list(DEFAULT_ACTIVE),
+    }
+    for p in load_sheet_players():
+        cat = p.get("category")
+        name = p.get("name", "").strip()
+        if cat in pools and name and name not in pools[cat]:
+            pools[cat].append(name)
+    return pools
+
+
+def get_category_for(name, pools):
+    for cat, names in pools.items():
+        if name in names:
+            return cat
+    return "Custom"
+
+
+# ============================================================
+# WIKIPEDIA BULK PULL (Option C)
+# ============================================================
+
+WIKI_PRESETS = {
+    "Ballon d'Or winners (iconic)": {
+        "category": "Ballon d'Or winners",
+        "assigned_pool": "Iconic retired",
+    },
+    "FIFA World Cup-winning captains (iconic)": {
+        "category": "FIFA World Cup-winning captains",
+        "assigned_pool": "Iconic retired",
+    },
+    "21st-century women's footballers (active)": {
+        "category": "21st-century women association football players",
+        "assigned_pool": "Active star",
+    },
+}
+
+
+def fetch_wikipedia_category(category_title, limit=200):
+    """
+    Fetch member articles of a Wikipedia category.
+    Returns list of clean player names (no namespace prefixes, no parentheses).
+    """
+    try:
+        url = "https://en.wikipedia.org/w/api.php"
+        params = {
+            "action": "query",
+            "list": "categorymembers",
+            "cmtitle": f"Category:{category_title}",
+            "cmlimit": str(limit),
+            "cmtype": "page",
+            "format": "json",
+        }
+        response = requests.get(url, params=params, timeout=15,
+                                headers={"User-Agent": "SoccerPicker/1.0"})
+        response.raise_for_status()
+        data = response.json()
+        members = data.get("query", {}).get("categorymembers", [])
+
+        names = []
+        for m in members:
+            title = m.get("title", "")
+            # Strip disambiguation suffixes like "(footballer)" or "(footballer, born 1985)"
+            clean = re.sub(r'\s*\([^)]*\)\s*', '', title).strip()
+            if clean and not clean.startswith(("Category:", "List ", "Template:")):
+                names.append(clean)
+        return names
+    except Exception as e:
+        return []
+
+
+# ============================================================
+# NEWS-DRIVEN DISCOVERY (Option B)
+# ============================================================
+
+def fetch_soccer_news(serpapi_key, query="soccer transfer breakout player 2026"):
+    """Search Google News via SerpAPI for soccer headlines."""
+    try:
+        url = "https://serpapi.com/search"
+        params = {
+            "engine": "google_news", "q": query,
+            "api_key": serpapi_key,
+        }
+        response = requests.get(url, params=params, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        articles = data.get("news_results", []) or []
+
+        headlines = []
+        for a in articles[:20]:
+            title = a.get("title", "")
+            snippet = a.get("snippet", "")
+            if title:
+                headlines.append(f"{title} — {snippet}".strip(" —"))
+        return headlines
+    except Exception as e:
+        return []
+
+
+def extract_players_from_headlines(headlines, anthropic_api_key):
+    """Use Claude to extract soccer player names from news headlines."""
+    if not ANTHROPIC_AVAILABLE or not anthropic_api_key or not headlines:
+        return []
+
+    try:
+        client = Anthropic(api_key=anthropic_api_key)
+        headlines_text = "\n".join(f"- {h}" for h in headlines)
+
+        message = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Extract soccer/football PLAYER names mentioned in these news "
+                    "headlines. Only player names — not coaches, executives, journalists, "
+                    "or team names. Return ONLY a JSON array of unique player names, "
+                    "no commentary, no markdown.\n\n"
+                    f"Headlines:\n{headlines_text}\n\n"
+                    'Format: ["Player Name 1", "Player Name 2", ...]'
+                ),
+            }],
+        )
+
+        text = message.content[0].text.strip()
+        # Strip markdown code fences if present
+        text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.MULTILINE).strip()
+        names = json.loads(text)
+        return [n for n in names if isinstance(n, str) and n.strip()]
+    except Exception as e:
+        st.sidebar.warning(f"Name extraction failed: {type(e).__name__}")
+        return []
+
+
+# ============================================================
+# YOUTUBE + TRENDS (analysis pipeline — unchanged from v4)
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_youtube_signals(player_name, api_key):
-    """
-    Single YouTube search → derives both Content Gap and YT Demand.
-
-    Content Gap = inverse of substantial-competitor count
-        (videos that are 5+ minutes AND have 50k+ views)
-    YT Demand = bucketed sum of view counts for top 10 most-viewed videos
-
-    Returns dict with: gap_score, comp_count, top_competitors,
-                       demand_score, total_views_top10
-    """
     try:
         youtube = build("youtube", "v3", developerKey=api_key)
-        query = f'"{player_name}"'  # quoted phrase for stricter matching
+        query = f'"{player_name}"'
         search = youtube.search().list(
             q=query, part="snippet", maxResults=50,
             type="video", order="viewCount",
         ).execute()
-
         items = search.get("items", [])
         video_ids = []
         for item in items:
             id_obj = item.get("id", {})
             if isinstance(id_obj, dict) and id_obj.get("videoId"):
                 video_ids.append(id_obj["videoId"])
-
         if not video_ids:
-            return {
-                "gap_score": 10, "comp_count": 0, "comp_total_views": 0, "top_competitors": [],
-                "demand_score": 1, "total_views_top10": 0,
-            }
+            return {"gap_score": 10, "comp_count": 0, "comp_total_views": 0,
+                    "top_competitors": [], "demand_score": 1, "total_views_top10": 0}
 
         stats_resp = youtube.videos().list(
-            id=",".join(video_ids),
-            part="statistics,contentDetails,snippet",
+            id=",".join(video_ids), part="statistics,contentDetails,snippet",
         ).execute()
-
         enriched = []
         for v in stats_resp.get("items", []):
-            duration_sec = parse_iso_duration(
-                v.get("contentDetails", {}).get("duration", "PT0S")
-            )
+            duration_sec = parse_iso_duration(v.get("contentDetails", {}).get("duration", "PT0S"))
             views = int(v.get("statistics", {}).get("viewCount", 0))
             title = v.get("snippet", {}).get("title", "")
-            enriched.append({
-                "title": title,
-                "views": views,
-                "duration_sec": duration_sec,
-                "duration_min": duration_sec // 60,
-            })
-
+            enriched.append({"title": title, "views": views,
+                             "duration_sec": duration_sec, "duration_min": duration_sec // 60})
         enriched.sort(key=lambda x: -x["views"])
 
-        # === Content gap from substantial competitors ===
-        # Two-factor scoring: count + view dominance
-        substantial = [
-            v for v in enriched
-            if v["duration_sec"] >= MIN_COMPETITOR_DURATION_SEC
-            and v["views"] >= MIN_COMPETITOR_VIEWS
-        ]
+        substantial = [v for v in enriched
+                       if v["duration_sec"] >= MIN_COMPETITOR_DURATION_SEC
+                       and v["views"] >= MIN_COMPETITOR_VIEWS]
         comp_count = len(substantial)
         comp_total_views = sum(v["views"] for v in substantial)
 
-        # Factor 1: count of competitors
         if comp_count == 0: count_score = 10
         elif comp_count == 1: count_score = 9
         elif comp_count == 2: count_score = 8
@@ -365,7 +553,6 @@ def fetch_youtube_signals(player_name, api_key):
         elif comp_count <= 40: count_score = 2
         else: count_score = 1
 
-        # Factor 2: total views of competitors (how dominant they are)
         if comp_total_views == 0: views_score = 10
         elif comp_total_views < 200_000: views_score = 9
         elif comp_total_views < 1_000_000: views_score = 8
@@ -379,7 +566,6 @@ def fetch_youtube_signals(player_name, api_key):
 
         gap_score = round((count_score + views_score) / 2)
 
-        # === Demand from top-10 view sum ===
         total_views_top10 = sum(v["views"] for v in enriched[:10])
         if total_views_top10 < 10_000: demand_score = 1
         elif total_views_top10 < 100_000: demand_score = 3
@@ -389,25 +575,19 @@ def fetch_youtube_signals(player_name, api_key):
         else: demand_score = 10
 
         return {
-            "gap_score": gap_score,
-            "comp_count": comp_count,
+            "gap_score": gap_score, "comp_count": comp_count,
             "comp_total_views": comp_total_views,
             "top_competitors": substantial[:5],
-            "demand_score": demand_score,
-            "total_views_top10": total_views_top10,
+            "demand_score": demand_score, "total_views_top10": total_views_top10,
         }
     except HttpError as e:
         st.error(f"YouTube API error for {player_name}: {e}")
-        return {
-            "gap_score": 5, "comp_count": -1, "comp_total_views": -1, "top_competitors": [],
-            "demand_score": 5, "total_views_top10": -1,
-        }
+        return {"gap_score": 5, "comp_count": -1, "comp_total_views": -1,
+                "top_competitors": [], "demand_score": 5, "total_views_top10": -1}
     except Exception as e:
         st.warning(f"Could not fetch YouTube data for {player_name}: {e}")
-        return {
-            "gap_score": 5, "comp_count": -1, "comp_total_views": -1, "top_competitors": [],
-            "demand_score": 5, "total_views_top10": -1,
-        }
+        return {"gap_score": 5, "comp_count": -1, "comp_total_views": -1,
+                "top_competitors": [], "demand_score": 5, "total_views_top10": -1}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -489,8 +669,18 @@ def generate_reason(name, scores, category=None, runner_up=None):
         margin = calc_weighted_score(scores) - calc_weighted_score(runner_up["scores"])
         if margin > 0:
             reason += f" Edges {runner_up['name']} by {margin:.1f} points."
-
     return reason
+
+
+def suggest_players(pools, num_icons, num_rising, num_active, exclude):
+    icons = [p for p in pools["Iconic retired"] if p not in exclude]
+    rising = [p for p in pools["Rising star"] if p not in exclude]
+    active = [p for p in pools["Active star"] if p not in exclude]
+    selection = []
+    selection += random.sample(icons, min(num_icons, len(icons)))
+    selection += random.sample(rising, min(num_rising, len(rising)))
+    selection += random.sample(active, min(num_active, len(active)))
+    return selection
 
 
 # ============================================================
@@ -498,10 +688,8 @@ def generate_reason(name, scores, category=None, runner_up=None):
 # ============================================================
 
 st.markdown("# ⚽ Soccer Player Picker")
-st.markdown(
-    '<p class="hero-tagline">Find under-served, surging players for your animated YouTube channel.</p>',
-    unsafe_allow_html=True
-)
+st.markdown('<p class="hero-tagline">Find under-served, surging players for your animated YouTube channel.</p>',
+            unsafe_allow_html=True)
 
 try:
     api_key = st.secrets["YOUTUBE_API_KEY"]
@@ -509,14 +697,144 @@ except (KeyError, FileNotFoundError):
     st.error("YouTube API key missing. Add `YOUTUBE_API_KEY` under Settings → Secrets.")
     st.stop()
 
-try:
-    serpapi_key = st.secrets["SERPAPI_KEY"]
-except (KeyError, FileNotFoundError):
-    serpapi_key = None
+serpapi_key = st.secrets.get("SERPAPI_KEY") if "SERPAPI_KEY" in st.secrets else None
+anthropic_key = st.secrets.get("ANTHROPIC_API_KEY") if "ANTHROPIC_API_KEY" in st.secrets else None
+sheets_configured = get_sheet() is not None
+
+if not serpapi_key:
     st.warning("SerpAPI key not set. Google Trends will default to 5. Sign up free at serpapi.com.")
 
 if "covered" not in st.session_state:
     st.session_state["covered"] = set()
+if "pending_news_players" not in st.session_state:
+    st.session_state["pending_news_players"] = []
+
+pools = get_combined_pools()
+sheet_players = load_sheet_players()
+
+
+# ============================================================
+# SIDEBAR — Player pool management
+# ============================================================
+
+with st.sidebar:
+    st.markdown("### 📋 Player pool")
+    total = sum(len(v) for v in pools.values())
+    st.caption(f"**{total} total** · {len(pools['Iconic retired'])} icons · {len(pools['Rising star'])} rising · {len(pools['Active star'])} active")
+
+    if not sheets_configured:
+        st.warning("Google Sheets not configured. Additions won't persist. See `GOOGLE_SHEETS_SETUP.md` to enable.")
+    else:
+        st.success(f"☁ Synced to Sheet ({len(sheet_players)} custom additions)")
+
+    st.divider()
+
+    # === Manual add (Option A) ===
+    with st.expander("➕ Add player manually", expanded=False):
+        with st.form("add_player_form", clear_on_submit=True):
+            new_name = st.text_input("Player name", placeholder="e.g. Jude Bellingham")
+            new_cat = st.selectbox("Category", CATEGORIES)
+            submitted = st.form_submit_button("Add", use_container_width=True)
+            if submitted and new_name.strip():
+                if sheets_configured:
+                    added, err = add_players_to_sheet([(new_name, new_cat)], "manual")
+                    if err:
+                        st.error(err)
+                    elif added:
+                        st.success(f"Added {new_name}")
+                        st.rerun()
+                    else:
+                        st.info(f"{new_name} is already in the pool.")
+                else:
+                    st.error("Configure Google Sheets first to persist additions.")
+
+    # === Wikipedia bulk (Option C) ===
+    with st.expander("📚 Pull from Wikipedia", expanded=False):
+        st.caption("Bulk-add players from curated Wikipedia categories.")
+        wiki_choice = st.selectbox("Source", list(WIKI_PRESETS.keys()), key="wiki_choice")
+        if st.button("Pull players", key="wiki_pull", use_container_width=True):
+            if not sheets_configured:
+                st.error("Configure Google Sheets first.")
+            else:
+                preset = WIKI_PRESETS[wiki_choice]
+                with st.spinner(f"Fetching from Wikipedia..."):
+                    names = fetch_wikipedia_category(preset["category"])
+                if not names:
+                    st.warning("No players found or fetch failed.")
+                else:
+                    pairs = [(n, preset["assigned_pool"]) for n in names]
+                    added, err = add_players_to_sheet(pairs, "wikipedia")
+                    if err:
+                        st.error(err)
+                    else:
+                        st.success(f"Added {added} new players (skipped {len(names) - added} duplicates).")
+                        st.rerun()
+
+    # === News-driven discovery (Option B) ===
+    with st.expander("📰 Discover from news", expanded=False):
+        st.caption("Scans recent soccer headlines and extracts rising player names.")
+        if not anthropic_key:
+            st.error("Anthropic API key not set. Add `ANTHROPIC_API_KEY` to secrets.")
+        elif not serpapi_key:
+            st.error("SerpAPI key required for news search.")
+        elif not sheets_configured:
+            st.error("Configure Google Sheets first.")
+        else:
+            news_query = st.text_input(
+                "News query",
+                value="soccer transfer breakout player 2026",
+                key="news_query",
+            )
+            if st.button("Scan news", key="news_pull", use_container_width=True):
+                with st.spinner("Fetching headlines..."):
+                    headlines = fetch_soccer_news(serpapi_key, news_query)
+                if not headlines:
+                    st.warning("No headlines found.")
+                else:
+                    with st.spinner(f"Extracting names from {len(headlines)} headlines..."):
+                        names = extract_players_from_headlines(headlines, anthropic_key)
+                    # Filter to genuinely new names
+                    existing = {p.lower() for p in (pools["Iconic retired"] + pools["Rising star"] + pools["Active star"])}
+                    new_names = [n for n in names if n.lower() not in existing]
+                    if not new_names:
+                        st.info("No new players found in headlines (all already in pool).")
+                    else:
+                        st.session_state["pending_news_players"] = new_names
+                        st.rerun()
+
+            # Show pending approvals
+            if st.session_state["pending_news_players"]:
+                st.markdown("**Approve to add (as Rising star):**")
+                approved = []
+                for nm in st.session_state["pending_news_players"]:
+                    if st.checkbox(nm, value=True, key=f"approve_{nm}"):
+                        approved.append((nm, "Rising star"))
+                if st.button("Add approved", type="primary", use_container_width=True):
+                    if approved:
+                        added, err = add_players_to_sheet(approved, "news")
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success(f"Added {added} players from news.")
+                    st.session_state["pending_news_players"] = []
+                    st.rerun()
+
+    # === View / manage custom additions ===
+    if sheet_players:
+        with st.expander(f"View custom additions ({len(sheet_players)})", expanded=False):
+            for p in sheet_players[-30:]:  # last 30 to keep sidebar manageable
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.caption(f"**{p.get('name')}** · {p.get('category')} · _{p.get('source')}_")
+                with col2:
+                    if st.button("✕", key=f"rm_{p.get('name')}_{p.get('added_at')}", help="Remove"):
+                        remove_player_from_sheet(p.get("name"))
+                        st.rerun()
+
+
+# ============================================================
+# MAIN — analysis flow (unchanged from v4 structure)
+# ============================================================
 
 st.markdown('<div class="section-label">Scoring weights</div>', unsafe_allow_html=True)
 cols = st.columns(5)
@@ -529,55 +847,44 @@ with st.expander("How this finds gaps — quick version"):
         """
 The picker targets a **demand-supply mismatch** — players people are actively searching for but who don't have enough quality content yet.
 
-- **Content gap** counts *substantial competitors* on YouTube — videos that are 3+ minutes long AND have 50k+ views — and also weighs how dominant they are (combined views). Two competitors with 80k views each is a real gap; two competitors with 5M views each is not. The score combines both signals.
-- **Google Trends** pulls the last 30 days of search interest and detects rising momentum — FC Mobile drops, transfers, tournament moments, breaking news.
-- **YT demand** confirms there's actual viewing happening for the player.
+- **Content gap** counts *substantial competitors* on YouTube — videos that are 3+ minutes long AND have 50k+ views — and weighs how dominant they are (combined views). Two competitors with 80k views each is a real gap; two with 5M views each is not.
+- **Google Trends** pulls the last 30 days of search interest and detects rising momentum.
+- **YT demand** confirms there's actual viewing happening.
 - **Story** and **skill** are your judgment calls.
 
-The combined 65% weight on gap + trends means the top picks will always be players with rising interest AND open lanes — exactly what YouTube Studio's Research tool surfaces, just outside the platform. Full methodology with brackets at the bottom of the page.
+The combined 65% weight on gap + trends targets the demand-supply mismatch directly.
         """
     )
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-mode = st.radio(
-    "Mode",
-    ["🎲 Suggest players for me", "📝 Analyze my list"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
+mode = st.radio("Mode", ["🎲 Suggest players for me", "📝 Analyze my list"],
+                horizontal=True, label_visibility="collapsed")
 
 players_to_analyze = []
 analyze_clicked = False
 
 if mode == "🎲 Suggest players for me":
     st.markdown('<div class="section-label" style="margin-top:1rem;">Player mix</div>', unsafe_allow_html=True)
-    st.caption("Icons benefit from World Cup tailwind. Rising stars ride FC Mobile / news spikes with low competition.")
+    st.caption(f"Sampling from your pool of {total} players. Icons benefit from World Cup tailwind. Rising stars ride FC Mobile / news spikes.")
 
     c1, c2, c3 = st.columns(3)
     with c1: num_icons = st.number_input("Iconic retired", 0, 10, 2)
     with c2: num_rising = st.number_input("Rising stars", 0, 10, 3)
     with c3: num_active = st.number_input("Active stars", 0, 10, 2)
 
-    total = num_icons + num_rising + num_active
-
-    if st.checkbox("Show candidate pools"):
-        tab1, tab2, tab3 = st.tabs(["Iconic retired", "Rising stars", "Active stars"])
-        with tab1: st.write(", ".join(ICONIC_PLAYERS))
-        with tab2: st.write(", ".join(RISING_STARS))
-        with tab3: st.write(", ".join(ACTIVE_STARS))
+    total_pick = num_icons + num_rising + num_active
 
     st.markdown("<br>", unsafe_allow_html=True)
     analyze_clicked = st.button(
-        f"🎲 Analyze {total} players" if total > 0 else "🎲 Analyze",
-        type="primary", use_container_width=True, disabled=(total == 0),
+        f"🎲 Analyze {total_pick} players" if total_pick > 0 else "🎲 Analyze",
+        type="primary", use_container_width=True, disabled=(total_pick == 0),
     )
     if analyze_clicked:
         players_to_analyze = suggest_players(
-            num_icons, num_rising, num_active,
+            pools, num_icons, num_rising, num_active,
             exclude=st.session_state["covered"],
         )
-
 else:
     st.markdown('<div class="section-label" style="margin-top:1rem;">Players to analyze</div>', unsafe_allow_html=True)
     default_players = "Lamine Yamal\nFlorian Wirtz\nTrinity Rodman\nJay-Jay Okocha\nVitor Roque"
@@ -609,7 +916,7 @@ if analyze_clicked and players_to_analyze:
             "storyRichness": 7, "skillTeachable": 7,
         }
         results.append({
-            "name": name, "category": get_category(name),
+            "name": name, "category": get_category_for(name, pools),
             "scores": scores,
             "raw": {
                 "comp_count": yt["comp_count"],
@@ -685,10 +992,7 @@ if "results" in st.session_state:
                 else:
                     gap_detail = "(fetch failed)"
                 st.markdown(f"Content gap: **{r['scores']['contentGap']}/10**  \n_{gap_detail}_")
-                st.markdown(
-                    f"Google Trends: **{r['scores']['googleTrends']}/10**  \n"
-                    f"_{r['raw']['trend_pct']:+.0f}% over 30d_"
-                )
+                st.markdown(f"Google Trends: **{r['scores']['googleTrends']}/10**  \n_{r['raw']['trend_pct']:+.0f}% over 30d_")
                 if r["raw"]["total_views_top10"] >= 0:
                     views_detail = f"{format_count(r['raw']['total_views_top10'])} views across top 10"
                 else:
@@ -741,11 +1045,9 @@ if "results" in st.session_state:
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     csv = df.to_csv(index=False)
-    st.download_button(
-        "Download as CSV", csv,
-        f"player_rankings_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-        "text/csv", use_container_width=True,
-    )
+    st.download_button("Download as CSV", csv,
+                       f"player_rankings_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                       "text/csv", use_container_width=True)
 
 st.markdown("<br><br>", unsafe_allow_html=True)
 st.markdown("---")
@@ -753,33 +1055,19 @@ st.markdown('<div class="section-label">How the scoring works</div>', unsafe_all
 st.markdown(
     """
 **Content gap — 35% weight — auto-scored from YouTube**
-Searches YouTube for the player's exact name (using a quoted phrase for stricter matching) and identifies **substantial competitors** — videos that are at least 3 minutes long AND have at least 50,000 views. The gap score is calculated from two factors averaged together:
-
-- *Count* of substantial competitors. Fewer = bigger gap. (0 = 10/10, 1-2 = 8-9/10, 3-7 = 6-7/10, 8-15 = 4-5/10, 16+ = 1-3/10)
-- *Total combined views* of those competitors. Lower = bigger gap. Two videos with 80k views combined is barely competition; two videos with 5M views combined is real dominance.
-
-The two-factor approach prevents both false positives (a player with one massive viral bio scoring as a gap just because the count is low) and false negatives (a player with many weak competitors scoring as saturated when the actual competition is mediocre).
+Searches YouTube for the player's exact name and identifies substantial competitors (3+ min, 50k+ views). The gap score averages two factors: count of competitors and total combined views (how dominant they are). Two videos with 80k views combined is barely competition; two with 5M views is real dominance.
 
 **Google Trends — 30% weight — auto-scored from SerpAPI**
-Pulls the player's Google search interest over the **last 30 days**. Compares the most recent third of that window to the earliest third to detect rising or falling momentum. The short window captures fresh signals — FC Mobile releases, recent transfers, tournament moments, breaking news — instead of slower long-term trends.
-*Scale: +100% rise = 10/10. Flat = 5/10. -50% drop = 3/10.*
+Pulls the last 30 days of Google search interest. Compares the most recent third of the window to the earliest third to detect rising or falling momentum.
 
 **YT demand — 15% weight — auto-scored from YouTube**
-Sums the view counts of the top 10 most-viewed videos for this player's name. High total means heavy attention is flowing to content about them — confirms an audience exists.
-*Scale: 100M+ combined views = 9/10. 1M = 5/10. Under 10K = 1/10.*
+Sums the view counts of the top 10 most-viewed videos for this player's name.
 
-**Story richness — 10% weight — manual slider**
-Your judgment on how compelling the player's life story is — childhood, struggles, breakthrough moment, signature personality.
-
-**Teachable skill — 10% weight — manual slider**
-How clearly you can break down the player's signature move into an animated lesson.
+**Story richness & Teachable skill — 10% each — manual sliders**
+Your judgment on how compelling the story is and how teachable the signature move is.
 
 ---
 
-**The demand-supply gap, explained.** The reason this works for finding gaps: a player with surging Google Trends (people searching) AND few substantial YouTube competitors (no good videos answering them) is a textbook demand-supply mismatch — exactly what YouTube Studio's Research tab surfaces. The 65% combined weight on Content Gap + Trends targets that mismatch directly. A player with 500k total videos but only 3 substantial bios is more open than this metric would have suggested before.
-
-**What gets shown in each candidate's card:** the actual competing videos (title, length, view count) so you can spot-check whether they're really competitors or just highlight reels sneaking past the filter. If the list looks wrong, the thresholds (5 min, 50k views) are easy to tune in the code.
-
-**Caching:** API results cached for 1 hour. The cache clears on each app redeploy, so your first analysis after a code change always returns fresh numbers.
+**Player pool sources.** The Suggest mode samples from a default set of ~130 hardcoded players plus anything your team has added via the sidebar (manual entry, Wikipedia category pulls, or news-driven discovery). All custom additions persist in a shared Google Sheet so your whole team sees the same pool.
 """
 )
