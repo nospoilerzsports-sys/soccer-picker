@@ -205,8 +205,8 @@ st.set_page_config(
 )
 
 WEIGHTS = {
-    "contentGap": 0.35, "googleTrends": 0.40, "ytSearchDemand": 0.15,
-    "contentFreshness": 0.10,
+    "contentGap": 0.20, "googleTrends": 0.40, "ytSearchDemand": 0.20,
+    "contentFreshness": 0.20,
 }
 LABELS = {
     "contentGap": "Content gap", "googleTrends": "Google Trends",
@@ -1218,10 +1218,10 @@ with st.expander("How this finds gaps — quick version"):
         """
 The picker is fully automated — every score comes from data. It targets a **demand-supply mismatch**: players people are actively searching for, but who don't have enough quality content yet.
 
-- **Content gap (35%)** — counts substantial competitors on YouTube (3+ min, 50k+ views) and weighs their combined view dominance. Two videos with 80k combined views is a real gap; two with 5M combined views is not.
-- **Google Trends (40%)** — pulls the last 30 days of search interest and detects rising momentum. Highest weight because rising interest is the strongest signal of upcoming demand.
-- **YT demand (15%)** — combines top-10 view volume with engagement quality (likes + comments per view). High views with low engagement is passive scrolling; high views with high engagement is hungry audience.
-- **Freshness (10%)** — months since the most recent substantial bio video was published. Stale top results mean fresh content will dominate the search rankings.
+- **Google Trends (40%)** — pulls the last 30 days of search interest and detects rising momentum. The highest single weight because rising interest is the strongest signal of upcoming demand.
+- **Content gap (20%)** — counts substantial competitors on YouTube (3+ min, 50k+ views) and weighs their combined view dominance. Two videos with 80k combined views is a real gap; two with 5M combined views is not.
+- **YT demand (20%)** — combines top-10 view volume with engagement quality (likes + comments per view). High views with low engagement is passive scrolling; high views with high engagement is hungry audience.
+- **Freshness (20%)** — months since the most recent substantial bio video was published. Stale top results mean fresh content will dominate the search rankings.
 
 No manual sliders. Every signal is computed live from YouTube + Google.
         """
@@ -1446,24 +1446,34 @@ st.markdown("---")
 st.markdown('<div class="section-label">How the scoring works</div>', unsafe_allow_html=True)
 st.markdown(
     """
-**Content gap — 35% weight — auto-scored from YouTube**
-Searches YouTube for the player's exact name and identifies substantial competitors (3+ min, 50k+ views). Gap score averages two factors: count of competitors and total combined views (how dominant they are). Two videos with 80k combined views is barely competition; two with 5M is real dominance.
-
 **Google Trends — 40% weight — auto-scored from SerpAPI**
 Pulls the last 30 days of Google search interest. Compares the most recent third of the window to the earliest third to detect rising or falling momentum. The highest single weight because rising search interest is the leading indicator of upcoming demand.
 
-**YT demand — 15% weight — auto-scored from YouTube**
+**Content gap — 20% weight — auto-scored from YouTube**
+Searches YouTube for the player's exact name and identifies substantial competitors (3+ min, 50k+ views). Gap score averages two factors: count of competitors and total combined views (how dominant they are). Two videos with 80k combined views is barely competition; two with 5M is real dominance.
+
+**YT demand — 20% weight — auto-scored from YouTube**
 Combines two signals weighted 65/35:
 - *Volume*: sum of top-10 video view counts (broad audience interest)
 - *Engagement quality*: average `(likes + comments × 3) / views` across the top 10 (active interest vs passive scrolling). Comments weighted 3× because creators can hide like counts but rarely hide comment counts.
 
 A player with 100M views and 0.3% engagement scores lower than one with 20M views and 4% engagement — because the second audience is hungry for content, not just casually scrolling.
 
-**Content freshness — 10% weight — auto-scored from YouTube**
+**Content freshness — 20% weight — auto-scored from YouTube**
 Months since the most recent substantial bio video was published. The dimension count alone misses: a player can have a few bios that all came out 2-3 years ago, and the audience has moved on. Fresh content will rank above stale top results almost automatically. No substantial bios at all = max freshness gap.
 
 ---
+"""
+)
 
-**Player pool sources.** The Suggest mode samples from a default set of ~130 hardcoded players plus anything your team has added via the sidebar (manual entry, Wikipedia category pulls, news-driven discovery, FC Mobile preset, or TOTW scanner). All custom additions persist in a shared Google Sheet so your whole team sees the same pool.
+# Dynamic pool-source description — reflects actual current counts
+default_total = len(DEFAULT_ICONIC) + len(DEFAULT_RISING) + len(DEFAULT_ACTIVE)
+sheet_count = len(sheet_players) if sheets_configured else 0
+current_total = sum(len(v) for v in pools.values())
+st.markdown(
+    f"""
+**Player pool sources.** Right now you're sampling from **{current_total} total players** —
+{default_total} hardcoded defaults ({len(DEFAULT_ICONIC)} iconic · {len(DEFAULT_RISING)} rising · {len(DEFAULT_ACTIVE)} active) plus {sheet_count} custom additions from your Google Sheet.
+Custom additions come from the sidebar — manual entry, Wikipedia category pulls, FC Mobile presets, TOTW scanner, or news-driven discovery — and persist in a shared Sheet so your whole team sees the same pool.
 """
 )
