@@ -12,6 +12,7 @@ import json
 import random
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -157,6 +158,29 @@ FC_MOBILE_FEATURED = [
     ("Sakina Karchaoui", "Active star"),
     ("Mapi Leon", "Active star"),
     ("Caroline Graham Hansen", "Active star"),
+]
+
+# Players from the FC Mobile full pool that should be recategorized
+# from "Active star" to "Rising star" (born ~2002 or later / recent breakout).
+# Names use the exact Excel spelling so they match the Sheet rows.
+RISING_RECLASSIFY = [
+    "Ryan Gravenberch", "Joško Gvardiol", "Xavi Simons", "Omar Marmoush",
+    "Anthony Gordon", "Lucas Chevalier", "Balde", "Murillo",
+    "Piero Hincapié", "Hugo Ekitiké", "Morgan Rogers", "Malik Tillman",
+    "Milos Kerkez", "Micky van de Ven", "Jurriën Timber", "Jonathan Burkardt",
+    "Dean Huijsen", "Savinho", "Khéphren Thuram", "Carlos Baleba",
+    "Johnny Cardoso", "Rayan Aït-Nouri", "Giuliano Simeone", "Anthony Elanga",
+    "Rayan Cherki", "Quinten Timber", "Destiny Udogie", "Álvaro Carreras",
+    "Curtis Jones", "Elliot Anderson", "Andrey Santos", "Georgiy Sudakov",
+    "Tino Livramento", "Benjamin Šeško", "Fermín", "Jérémy Doku",
+    "Levi Colwill", "Maghnes Akliouche", "Castello Lukeba", "Ousmane Diomande",
+    "Kouadio Manu Koné", "Ian Maatsen", "Pape Matar Sarr", "Ismael Saibari",
+    "Alan Varela", "Aleksandar Pavlović", "Malo Gusto", "Arnau Martínez",
+    "Thiago Almada", "Lee Kang In", "Nico Paz", "Maximilian Beier",
+    "Jhon Durán", "Fábio Silva", "Nick Woltemade", "Illia Zabarnyi",
+    "Marcos Leonardo", "Jarrad Branthwaite", "Kenneth Taylor", "Luka Sučić",
+    "Hugo Larsson", "Jacob Ramsey", "Luis Henrique", "Myles Lewis-Skelly",
+    "Riccardo Calafiori",
 ]
 
 CATEGORIES = ["Iconic retired", "Rising star", "Active star"]
@@ -372,14 +396,21 @@ def load_sheet_players():
         return []
 
 
+def normalize_name(s):
+    """Strip accents and lowercase for forgiving name comparison."""
+    if not s:
+        return ""
+    return unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii').lower().strip()
+
+
 def add_players_to_sheet(new_players, source):
     """Add multiple players. new_players is list of (name, category) tuples."""
     sheet = get_sheet()
     if sheet is None:
         return 0, "Sheets not configured."
     try:
-        existing = {r["name"].lower() for r in sheet.get_all_records() if r.get("name")}
-        default_all = {p.lower() for p in (DEFAULT_ICONIC + DEFAULT_RISING + DEFAULT_ACTIVE)}
+        existing = {normalize_name(r["name"]) for r in sheet.get_all_records() if r.get("name")}
+        default_all = {normalize_name(p) for p in (DEFAULT_ICONIC + DEFAULT_RISING + DEFAULT_ACTIVE)}
 
         rows_to_add = []
         added_count = 0
@@ -387,13 +418,14 @@ def add_players_to_sheet(new_players, source):
             name_clean = name.strip()
             if not name_clean:
                 continue
-            if name_clean.lower() in existing or name_clean.lower() in default_all:
+            norm = normalize_name(name_clean)
+            if norm in existing or norm in default_all:
                 continue
             rows_to_add.append([
                 name_clean, category, source,
                 datetime.now().strftime("%Y-%m-%d %H:%M"),
             ])
-            existing.add(name_clean.lower())
+            existing.add(norm)
             added_count += 1
 
         if rows_to_add:
@@ -402,6 +434,43 @@ def add_players_to_sheet(new_players, source):
         return added_count, None
     except Exception as e:
         return 0, f"{type(e).__name__}: {e}"
+
+
+def reclassify_in_sheet(target_names, new_category):
+    """
+    Update category for matching names in the Sheet (batch update for efficiency).
+    Matches by accent-normalized name.
+    Returns (updated_count, not_found_list, error).
+    """
+    sheet = get_sheet()
+    if sheet is None:
+        return 0, [], "Sheets not configured."
+    try:
+        records = sheet.get_all_records()
+        # Build map from normalized name → row number (header is row 1, so data starts at row 2)
+        name_to_row = {}
+        for i, r in enumerate(records, start=2):
+            if r.get("name"):
+                name_to_row[normalize_name(r["name"])] = i
+
+        updates = []
+        not_found = []
+        for name in target_names:
+            row_num = name_to_row.get(normalize_name(name))
+            if row_num is None:
+                not_found.append(name)
+                continue
+            updates.append({
+                "range": f"B{row_num}",  # column B = category
+                "values": [[new_category]],
+            })
+
+        if updates:
+            sheet.batch_update(updates)
+        load_sheet_players.clear()
+        return len(updates), not_found, None
+    except Exception as e:
+        return 0, [], f"{type(e).__name__}: {e}"
 
 
 def remove_player_from_sheet(player_name):
@@ -424,17 +493,26 @@ def get_combined_pools():
     """
     Combine default pools + Sheet additions.
     Returns dict mapping category -> list of player names.
+    Accent-aware dedup: 'Pau Cubarsí' won't be added if 'Pau Cubarsi' is already present.
     """
     pools = {
         "Iconic retired": list(DEFAULT_ICONIC),
         "Rising star": list(DEFAULT_RISING),
         "Active star": list(DEFAULT_ACTIVE),
     }
+    seen_normalized = {
+        normalize_name(n) for cat_list in pools.values() for n in cat_list
+    }
     for p in load_sheet_players():
         cat = p.get("category")
         name = p.get("name", "").strip()
-        if cat in pools and name and name not in pools[cat]:
-            pools[cat].append(name)
+        if not (cat in pools and name):
+            continue
+        norm = normalize_name(name)
+        if norm in seen_normalized:
+            continue
+        pools[cat].append(name)
+        seen_normalized.add(norm)
     return pools
 
 
@@ -1097,6 +1175,32 @@ with st.sidebar:
                     if st.button("✕", key=f"rm_{p.get('name')}_{p.get('added_at')}", help="Remove"):
                         remove_player_from_sheet(p.get("name"))
                         st.rerun()
+
+    # === Maintenance ===
+    with st.expander("🛠️ Maintenance", expanded=False):
+        st.caption(
+            f"One-shot tools for cleaning up the pool. "
+            f"The reclassify button below moves {len(RISING_RECLASSIFY)} young breakout players "
+            "(born ~2002+ or recent breakouts) from Active → Rising star. "
+            "Run once after the FC Mobile full pool import."
+        )
+        if st.button(f"Reclassify {len(RISING_RECLASSIFY)} players as Rising stars",
+                     key="reclass_rising", use_container_width=True):
+            if not sheets_configured:
+                st.error("Configure Google Sheets first.")
+            else:
+                with st.spinner("Reclassifying..."):
+                    updated, not_found, err = reclassify_in_sheet(RISING_RECLASSIFY, "Rising star")
+                if err:
+                    st.error(err)
+                else:
+                    st.success(f"Reclassified {updated} players as Rising stars.")
+                    if not_found:
+                        st.warning(
+                            f"{len(not_found)} not found in Sheet (probably not yet imported): "
+                            f"{', '.join(not_found[:5])}{'...' if len(not_found) > 5 else ''}"
+                        )
+                    st.rerun()
 
 
 # ============================================================
