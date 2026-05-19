@@ -516,9 +516,33 @@ def get_combined_pools():
     return pools
 
 
+def clean_player_input(raw):
+    """
+    Clean user-typed player names by stripping common annotations.
+    Examples:
+      'Marta — Brazil'       → 'Marta'
+      'Marta - Brazil'       → 'Marta'
+      'Désiré Doué (France)' → 'Désiré Doué'
+      'Lamine Yamal, 17'     → 'Lamine Yamal'
+      '* Vinicius Junior'    → 'Vinicius Junior'
+    """
+    if not raw:
+        return ""
+    s = raw.strip()
+    # Strip leading bullets/dashes/asterisks
+    s = re.sub(r'^[\s\-\*\u2022\u2023\u25E6\u2043\u2219]+', '', s)
+    # Strip trailing annotations starting with em dash, en dash, hyphen-with-spaces, or open paren
+    s = re.split(r'\s+[\u2014\u2013]\s+|\s+-\s+|\s*\(', s)[0]
+    # Strip trailing commas + anything after (e.g. ', 17 years old')
+    s = s.split(',')[0]
+    return s.strip()
+
+
 def get_category_for(name, pools):
+    """Accent-tolerant category lookup."""
+    target = normalize_name(name)
     for cat, names in pools.items():
-        if name in names:
+        if any(normalize_name(n) == target for n in names):
             return cat
     return "Custom"
 
@@ -1258,12 +1282,16 @@ if mode == "🎲 Suggest players for me":
         )
 else:
     st.markdown('<div class="section-label" style="margin-top:1rem;">Players to analyze</div>', unsafe_allow_html=True)
+    st.caption(
+        "One name per line. Country suffixes (e.g. `Marta — Brazil`), bullets, and "
+        "annotations in parentheses are stripped automatically. Accent-insensitive matching."
+    )
     default_players = "Lamine Yamal\nFlorian Wirtz\nTrinity Rodman\nJay-Jay Okocha\nVitor Roque"
     players_input = st.text_area("Names", value=default_players, height=140, label_visibility="collapsed")
     st.markdown("<br>", unsafe_allow_html=True)
     analyze_clicked = st.button("🔍 Analyze players", type="primary", use_container_width=True)
     if analyze_clicked:
-        players_to_analyze = [p.strip() for p in players_input.split("\n") if p.strip()]
+        players_to_analyze = [clean_player_input(p) for p in players_input.split("\n") if clean_player_input(p)]
 
 
 if analyze_clicked and players_to_analyze:
