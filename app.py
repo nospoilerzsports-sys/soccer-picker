@@ -55,8 +55,8 @@ MIN_COMPETITOR_VIEWS = 50_000
 # (volume buckets, engagement %, freshness months) or the demand-combination weight (0.65/0.35),
 # since those aren't auto-detected via this string.
 SCORING_VERSION = (
-    f"v4-dur{MIN_COMPETITOR_DURATION_SEC}-views{MIN_COMPETITOR_VIEWS}"
-    "-demand65-comments3-disambig:soccer-football"
+    f"v6-dur{MIN_COMPETITOR_DURATION_SEC}-views{MIN_COMPETITOR_VIEWS}"
+    "-demand65-comments3-disambig:soccer-football-mediumsearch-biofilter"
 )
 
 
@@ -863,6 +863,77 @@ def extract_players_from_headlines(headlines, anthropic_api_key):
 # YOUTUBE + TRENDS (analysis pipeline — unchanged from v4)
 # ============================================================
 
+def is_likely_bio(title, duration_sec):
+    """
+    Heuristic classifier: is this video competing for 'tell me about this player' intent?
+
+    Mission-critical: an animated bio competes with other bios, documentaries, and
+    long-form narrative content — NOT with highlight reels, goal compilations,
+    match analysis, skill showcases, etc.
+
+    Returns True if the video is plausibly bio-style competition.
+    """
+    if not title:
+        return False
+    t = title.lower()
+
+    # Hard exclusions: explicit non-bio content patterns
+    NON_BIO_MARKERS = (
+        "all goals", "every goal", "top goals", "best goals", "goals only",
+        "goal compilation", "goals of",
+        "best skills", "all skills", "skills only", "best moves", "all moves",
+        "skill compilation", "skills compilation",
+        "saves only", "best saves", "all saves", "save compilation",
+        "best tackles", "all tackles",
+        " vs ", " vs.", " v ", " against ", "fc vs", "united vs",
+        "full match", "match highlights", "extended highlights",
+        "highlights only", " highlights ",
+        "compilation",
+        "best moments", "top moments", "all moments",
+        "free kicks", "free kick of", "every free kick",
+        "penalty kicks", "penalty miss",
+        "training session", "warm up",
+        "press conference", "interview only", "full interview",
+        "first goal", "last goal", "debut goal",
+        "best assists", "all assists",
+    )
+    if any(kw in t for kw in NON_BIO_MARKERS):
+        return False
+
+    # Strong positive: long-form content (15+ min) — almost always narrative
+    if duration_sec >= 900:
+        return True
+
+    # Positive markers: bio-style language in title
+    BIO_MARKERS = (
+        # Direct bio terminology
+        "story", "biograph", "documentary",
+        # Life narrative
+        "career", "life of", "his life", "journey", "rise of", "rise to",
+        "untold", "history of", "the history",
+        # Time-based narrative
+        "kid", "child", "young", "early years", "childhood", "growing up",
+        # Tribute/profile
+        "tribute", "profile of", "introducing", "meet ",
+        # Legend/icon framing
+        "legend", "icon ", "king of", "magic of", "the great",
+        # Transformation
+        "from kid", "from young", "from boy", "from child",
+        "to legend", "to greatness", "to king", "to icon", "to star",
+        # Description framing
+        "all about", "all you need", "everything about", "everything you",
+        # Adjectival framing
+        "amazing", "incredible", "fascinating", "complete",
+        # Era / generational
+        "the black", "the white", "the golden", "the new",
+    )
+    if any(kw in t for kw in BIO_MARKERS):
+        return True
+
+    # Uncertain — default conservative (count as bio) so we don't over-promise gaps
+    return True
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_youtube_signals(player_name, api_key, _cache_version=SCORING_VERSION):
     """
@@ -871,12 +942,14 @@ def fetch_youtube_signals(player_name, api_key, _cache_version=SCORING_VERSION):
     """
     empty_result = {
         "gap_score": 10, "comp_count": 0, "comp_total_views": 0,
+        "nonbio_filtered": 0,
         "top_competitors": [], "demand_score": 1, "total_views_top10": 0,
         "avg_engagement_pct": 0.0,
         "freshness_score": 10, "most_recent_months": None,
     }
     error_result = {
         "gap_score": 5, "comp_count": -1, "comp_total_views": -1,
+        "nonbio_filtered": 0,
         "top_competitors": [], "demand_score": 5, "total_views_top10": -1,
         "avg_engagement_pct": 0.0,
         "freshness_score": 5, "most_recent_months": None,
@@ -886,44 +959,81 @@ def fetch_youtube_signals(player_name, api_key, _cache_version=SCORING_VERSION):
         # Quoted exact-name requirement + sport disambiguators to defeat namespace collisions.
         # Example: '"Marta" soccer football' excludes Knives Out / songs / Saint Martha results.
         query = f'"{player_name}" soccer football'
-        search = youtube.search().list(
+
+        # SEARCH 1: general (all durations, view-sorted) — used for YT demand metric
+        search_general = youtube.search().list(
             q=query, part="snippet", maxResults=50,
             type="video", order="viewCount",
         ).execute()
-        items = search.get("items", [])
-        video_ids = []
-        for item in items:
+
+        # SEARCH 2: medium-length only (4-20 min) — captures bio content that gets
+        # buried below shorts/clips in the general view-ranked results. Critical for
+        # famous players where the top-50 by views is almost entirely highlight reels.
+        search_medium = youtube.search().list(
+            q=query, part="snippet", maxResults=50,
+            type="video", order="viewCount",
+            videoDuration="medium",
+        ).execute()
+
+        # Track which IDs came from the general search (needed for YT demand top-10)
+        ids_general = []
+        for item in search_general.get("items", []):
             id_obj = item.get("id", {})
             if isinstance(id_obj, dict) and id_obj.get("videoId"):
-                video_ids.append(id_obj["videoId"])
-        if not video_ids:
+                ids_general.append(id_obj["videoId"])
+
+        ids_medium = []
+        for item in search_medium.get("items", []):
+            id_obj = item.get("id", {})
+            if isinstance(id_obj, dict) and id_obj.get("videoId"):
+                ids_medium.append(id_obj["videoId"])
+
+        all_ids = list(dict.fromkeys(ids_general + ids_medium))  # dedupe preserving order
+
+        if not all_ids:
             return empty_result
 
-        stats_resp = youtube.videos().list(
-            id=",".join(video_ids), part="statistics,contentDetails,snippet",
-        ).execute()
-        enriched = []
-        for v in stats_resp.get("items", []):
-            stats = v.get("statistics", {})
-            views = int(stats.get("viewCount", 0))
-            likes = int(stats.get("likeCount", 0))
-            comments = int(stats.get("commentCount", 0))
-            duration_sec = parse_iso_duration(v.get("contentDetails", {}).get("duration", "PT0S"))
-            snip = v.get("snippet", {})
-            enriched.append({
-                "title": snip.get("title", ""), "views": views,
-                "likes": likes, "comments": comments,
-                "duration_sec": duration_sec, "duration_min": duration_sec // 60,
-                "published_at": snip.get("publishedAt", ""),
-            })
-        enriched.sort(key=lambda x: -x["views"])
+        # Batch videos.list (50 IDs per call max)
+        enriched_by_id = {}
+        for batch_start in range(0, len(all_ids), 50):
+            batch = all_ids[batch_start:batch_start + 50]
+            stats_resp = youtube.videos().list(
+                id=",".join(batch),
+                part="statistics,contentDetails,snippet",
+            ).execute()
+            for v in stats_resp.get("items", []):
+                stats = v.get("statistics", {})
+                views = int(stats.get("viewCount", 0))
+                likes = int(stats.get("likeCount", 0))
+                comments = int(stats.get("commentCount", 0))
+                duration_sec = parse_iso_duration(v.get("contentDetails", {}).get("duration", "PT0S"))
+                snip = v.get("snippet", {})
+                enriched_by_id[v.get("id")] = {
+                    "title": snip.get("title", ""), "views": views,
+                    "likes": likes, "comments": comments,
+                    "duration_sec": duration_sec, "duration_min": duration_sec // 60,
+                    "published_at": snip.get("publishedAt", ""),
+                }
 
-        # === Content gap: count + view-dominance (unchanged) ===
-        substantial = [v for v in enriched
-                       if v["duration_sec"] >= MIN_COMPETITOR_DURATION_SEC
-                       and v["views"] >= MIN_COMPETITOR_VIEWS]
+        # General-search videos in view-count order — for YT demand metric
+        enriched_general = [enriched_by_id[i] for i in ids_general if i in enriched_by_id]
+        enriched_general.sort(key=lambda x: -x["views"])
+
+        # All videos (general + medium union) — for substantial competitor analysis
+        enriched_all = list(enriched_by_id.values())
+        enriched_all.sort(key=lambda x: -x["views"])
+
+        # === Content gap: BIO competitors only ===
+        # First pass: substantial-size filter (length + view threshold)
+        substantial_all = [v for v in enriched_all
+                           if v["duration_sec"] >= MIN_COMPETITOR_DURATION_SEC
+                           and v["views"] >= MIN_COMPETITOR_VIEWS]
+        # Second pass: actually bio-style? (filters out highlight reels, compilations, match recaps)
+        substantial = [v for v in substantial_all if is_likely_bio(v["title"], v["duration_sec"])]
         comp_count = len(substantial)
         comp_total_views = sum(v["views"] for v in substantial)
+        # Track non-bio count for transparency in UI
+        nonbio_filtered = len(substantial_all) - len(substantial)
 
         if comp_count == 0: count_score = 10
         elif comp_count == 1: count_score = 9
@@ -949,8 +1059,8 @@ def fetch_youtube_signals(player_name, api_key, _cache_version=SCORING_VERSION):
 
         gap_score = round((count_score + views_for_gap) / 2)
 
-        # === YT demand: volume + engagement ===
-        top10 = enriched[:10]
+        # === YT demand: volume + engagement (uses general search only — broad audience signal) ===
+        top10 = enriched_general[:10]
         total_views_top10 = sum(v["views"] for v in top10)
 
         # Volume bucket
@@ -1007,6 +1117,7 @@ def fetch_youtube_signals(player_name, api_key, _cache_version=SCORING_VERSION):
         return {
             "gap_score": gap_score, "comp_count": comp_count,
             "comp_total_views": comp_total_views,
+            "nonbio_filtered": nonbio_filtered,
             "top_competitors": substantial[:5],
             "demand_score": demand_score, "total_views_top10": total_views_top10,
             "avg_engagement_pct": avg_engagement_pct,
@@ -1020,7 +1131,7 @@ def fetch_youtube_signals(player_name, api_key, _cache_version=SCORING_VERSION):
         return error_result
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_serpapi_quota(serpapi_key):
     """
     Fetch SerpAPI account usage. Returns (used, left, total) or (None, None, None) on error.
@@ -1189,12 +1300,18 @@ with st.sidebar:
         if quota_used is not None and quota_total:
             pct = quota_used / quota_total * 100
             quota_msg = f"SerpAPI: {quota_used}/{quota_total} used this month ({pct:.0f}%)"
-            if pct >= 90:
-                st.error(f"⚠ {quota_msg} — analyses may fail soon")
-            elif pct >= 70:
-                st.warning(f"⚠ {quota_msg}")
-            else:
-                st.caption(f"☁ {quota_msg}")
+            qcol1, qcol2 = st.columns([5, 1])
+            with qcol1:
+                if pct >= 90:
+                    st.error(f"⚠ {quota_msg} — analyses may fail soon")
+                elif pct >= 70:
+                    st.warning(f"⚠ {quota_msg}")
+                else:
+                    st.caption(f"☁ {quota_msg}")
+            with qcol2:
+                if st.button("↻", key="quota_refresh", help="Force refresh quota (display caches for 60s)"):
+                    get_serpapi_quota.clear()
+                    st.rerun()
 
     st.divider()
 
@@ -1449,9 +1566,9 @@ with st.expander("How this finds gaps — quick version"):
 The picker is fully automated — every score comes from data. It targets a **demand-supply mismatch**: players people are actively searching for, but who don't have enough quality content yet.
 
 - **Google Trends (40%)** — pulls the last 30 days of search interest and detects rising momentum. The highest single weight because rising interest is the strongest signal of upcoming demand.
-- **Content gap (20%)** — counts substantial competitors on YouTube (3+ min, 50k+ views) and weighs their combined view dominance. Two videos with 80k combined views is a real gap; two with 5M combined views is not.
+- **Content gap (20%)** — counts actual *bio competitors* on YouTube (3+ min, 50k+ views, filtered to exclude highlight reels, compilations, and match recaps) and weighs their combined view dominance. Two bio competitors with 80k combined views is a real gap; two with 5M combined views is not.
 - **YT demand (20%)** — combines top-10 view volume with engagement quality (likes + comments per view). High views with low engagement is passive scrolling; high views with high engagement is hungry audience.
-- **Freshness (20%)** — months since the most recent substantial bio video was published. Stale top results mean fresh content will dominate the search rankings.
+- **Freshness (20%)** — months since the most recent bio competitor was published. Stale top results mean fresh content will dominate the search rankings. A recent highlight upload doesn't count — only actual bio content.
 
 No manual sliders. Every signal is computed live from YouTube + Google.
         """
@@ -1539,6 +1656,7 @@ if analyze_clicked and players_to_analyze:
             "raw": {
                 "comp_count": yt["comp_count"],
                 "comp_total_views": yt["comp_total_views"],
+                "nonbio_filtered": yt.get("nonbio_filtered", 0),
                 "top_competitors": yt["top_competitors"],
                 "trend_pct": gt_pct,
                 "total_views_top10": yt["total_views_top10"],
@@ -1631,12 +1749,14 @@ if "results" in st.session_state:
 
             # Gap
             if r["raw"]["comp_count"] >= 0:
+                nonbio = r["raw"].get("nonbio_filtered", 0)
+                filter_note = f" · {nonbio} non-bio videos filtered" if nonbio else ""
                 if r["raw"]["comp_count"] == 0:
-                    gap_detail = "0 substantial competitors — wide open"
+                    gap_detail = f"0 bio competitors — wide open{filter_note}"
                 else:
                     gap_detail = (
-                        f"{r['raw']['comp_count']} competitors · "
-                        f"{format_count(r['raw']['comp_total_views'])} combined views"
+                        f"{r['raw']['comp_count']} bio competitors · "
+                        f"{format_count(r['raw']['comp_total_views'])} combined views{filter_note}"
                     )
             else:
                 gap_detail = "(fetch failed)"
@@ -1683,7 +1803,7 @@ if "results" in st.session_state:
                         unsafe_allow_html=True
                     )
             elif r["raw"]["comp_count"] == 0:
-                st.success("✨ No substantial competitors found — wide-open lane.")
+                st.success("✨ No bio competitors found — wide-open lane.")
 
             # Mark / Uncover toggle per result
             st.markdown("<br>", unsafe_allow_html=True)
@@ -1760,7 +1880,9 @@ st.markdown(
 Pulls the last 30 days of Google search interest. Compares the most recent third of the window to the earliest third to detect rising or falling momentum. The highest single weight because rising search interest is the leading indicator of upcoming demand.
 
 **Content gap — 20% weight — auto-scored from YouTube**
-Searches YouTube with `"player name" soccer football` — the quoted exact name must appear in the video, with soccer/football terms boosting ranking to defeat namespace collisions (e.g. "Marta" the movie character vs the Brazilian footballer; "Diego Luna" the actor vs the USMNT midfielder). Identifies substantial competitors (3+ min, 50k+ views). Gap score averages two factors: count of competitors and total combined views (how dominant they are). Two videos with 80k combined views is barely competition; two with 5M is real dominance.
+Runs two YouTube searches: one general (all durations) for the YT demand metric below, and a second restricted to medium-length videos (4-20 min) to surface bio-style content that gets buried below shorts and clips in the view-ranked top 50 for famous players. Both queries use `"player name" soccer football` — the quoted name must appear, soccer/football terms defeat namespace collisions (e.g. "Marta" the movie character vs the footballer).
+
+Substantial competitors (3+ min, 50k+ views) from the combined pool are then **filtered for bio-likeness**: titles containing "all goals," "compilation," "highlights only," "vs," etc. are excluded as non-bio content. Long-form (15+ min) videos and titles containing bio language ("story," "biography," "documentary," "career," "journey," etc.) are kept. This is the mission-critical filter: an animated bio competes with other bios and documentaries, not with highlight reels. Gap score averages count and total combined views of bio competitors.
 
 **YT demand — 20% weight — auto-scored from YouTube**
 Combines two signals weighted 65/35:
@@ -1770,7 +1892,7 @@ Combines two signals weighted 65/35:
 A player with 100M views and 0.3% engagement scores lower than one with 20M views and 4% engagement — because the second audience is hungry for content, not just casually scrolling.
 
 **Content freshness — 20% weight — auto-scored from YouTube**
-Months since the most recent substantial bio video was published. The dimension count alone misses: a player can have a few bios that all came out 2-3 years ago, and the audience has moved on. Fresh content will rank above stale top results almost automatically. No substantial bios at all = max freshness gap.
+Months since the most recent bio competitor was published — uses the same bio-filtered competitor pool as Content gap. The dimension count alone misses: a player can have a few bios that all came out 2-3 years ago, and the audience has moved on. Fresh content will rank above stale top results almost automatically. No bio competitors at all = max freshness gap. A recent highlight upload doesn't hurt this score — only actual bio content does.
 
 ---
 """
