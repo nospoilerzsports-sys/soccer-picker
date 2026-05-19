@@ -50,6 +50,15 @@ except ImportError:
 MIN_COMPETITOR_DURATION_SEC = 180
 MIN_COMPETITOR_VIEWS = 50_000
 
+# Bumped whenever search query, scoring thresholds, bucket boundaries, OR formula constants change.
+# IMPORTANT: increment the manual 'v' number whenever you change inlined bucket boundaries
+# (volume buckets, engagement %, freshness months) or the demand-combination weight (0.65/0.35),
+# since those aren't auto-detected via this string.
+SCORING_VERSION = (
+    f"v4-dur{MIN_COMPETITOR_DURATION_SEC}-views{MIN_COMPETITOR_VIEWS}"
+    "-demand65-comments3-disambig:soccer-football"
+)
+
 
 # ============================================================
 # DEFAULT PLAYER POOLS (always available, augmented by Sheet)
@@ -353,33 +362,55 @@ def category_badge_html(category):
 # GOOGLE SHEETS PERSISTENCE
 # ============================================================
 
-def get_sheet():
-    """Connect to the Google Sheet (cached)."""
+@st.cache_resource(show_spinner=False)
+def get_gspread_client():
+    """Authorized gspread client. Cached for the Streamlit session lifetime."""
     if not GSPREAD_AVAILABLE:
         return None
-    if "GCP_SERVICE_ACCOUNT" not in st.secrets or "SHEET_NAME" not in st.secrets:
+    if "GCP_SERVICE_ACCOUNT" not in st.secrets:
         return None
     try:
-        creds_dict = json.loads(st.secrets["GCP_SERVICE_ACCOUNT"]) if isinstance(st.secrets["GCP_SERVICE_ACCOUNT"], str) else dict(st.secrets["GCP_SERVICE_ACCOUNT"])
+        raw = st.secrets["GCP_SERVICE_ACCOUNT"]
+        creds_dict = json.loads(raw) if isinstance(raw, str) else dict(raw)
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sheet = gc.open(st.secrets["SHEET_NAME"]).sheet1
+        return gspread.authorize(creds)
+    except Exception:
+        return None
 
-        # Ensure headers exist
+
+@st.cache_resource(show_spinner=False)
+def get_spreadsheet():
+    """The player pool spreadsheet object. Cached resource."""
+    gc = get_gspread_client()
+    if gc is None or "SHEET_NAME" not in st.secrets:
+        return None
+    try:
+        return gc.open(st.secrets["SHEET_NAME"])
+    except Exception:
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def get_sheet():
+    """First worksheet (player pool). Cached resource."""
+    spreadsheet = get_spreadsheet()
+    if spreadsheet is None:
+        return None
+    try:
+        sheet = spreadsheet.sheet1
+        # Ensure headers exist (only runs on first cache build)
         try:
             headers = sheet.row_values(1)
             if not headers:
                 sheet.update("A1:D1", [["name", "category", "source", "added_at"]])
         except Exception:
             sheet.update("A1:D1", [["name", "category", "source", "added_at"]])
-
         return sheet
-    except Exception as e:
-        st.sidebar.error(f"Sheet connection failed: {type(e).__name__}")
+    except Exception:
         return None
 
 
@@ -436,16 +467,34 @@ def add_players_to_sheet(new_players, source):
         return 0, f"{type(e).__name__}: {e}"
 
 
+def col_letter(n):
+    """Convert 1-indexed column number to A1 letter (1→A, 2→B, 27→AA)."""
+    result = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        result = chr(65 + r) + result
+    return result
+
+
 def reclassify_in_sheet(target_names, new_category):
     """
     Update category for matching names in the Sheet (batch update for efficiency).
     Matches by accent-normalized name.
+    Looks up the 'category' column dynamically — works even if columns are reordered.
     Returns (updated_count, not_found_list, error).
     """
     sheet = get_sheet()
     if sheet is None:
         return 0, [], "Sheets not configured."
     try:
+        # Find the category column dynamically from the header row
+        headers = sheet.row_values(1)
+        try:
+            cat_col_idx = headers.index("category") + 1  # 1-indexed for A1 notation
+        except ValueError:
+            return 0, [], "Sheet has no 'category' column"
+        cat_col = col_letter(cat_col_idx)
+
         records = sheet.get_all_records()
         # Build map from normalized name → row number (header is row 1, so data starts at row 2)
         name_to_row = {}
@@ -461,7 +510,7 @@ def reclassify_in_sheet(target_names, new_category):
                 not_found.append(name)
                 continue
             updates.append({
-                "range": f"B{row_num}",  # column B = category
+                "range": f"{cat_col}{row_num}",
                 "values": [[new_category]],
             })
 
@@ -487,6 +536,113 @@ def remove_player_from_sheet(player_name):
         return False
     except Exception:
         return False
+
+
+# ============================================================
+# COVERED PLAYERS — persistent, team-shared
+# ============================================================
+
+@st.cache_resource(show_spinner=False)
+def get_covered_worksheet():
+    """Get or create the 'covered' worksheet. Cached resource."""
+    spreadsheet = get_spreadsheet()
+    if spreadsheet is None:
+        return None
+    try:
+        try:
+            ws = spreadsheet.worksheet("covered")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = spreadsheet.add_worksheet(title="covered", rows=2000, cols=2)
+            ws.update("A1:B1", [["name", "covered_at"]])
+        return ws
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_covered_names():
+    """Return set of normalized covered player names."""
+    ws = get_covered_worksheet()
+    if ws is None:
+        return set()
+    try:
+        records = ws.get_all_records()
+        return {r["name"] for r in records if r.get("name")}
+    except Exception:
+        return set()
+
+
+def mark_covered_in_sheet(name):
+    ws = get_covered_worksheet()
+    if ws is None:
+        return False
+    try:
+        existing = {r.get("name") for r in ws.get_all_records()}
+        if name in existing:
+            return True  # already covered
+        ws.append_row([name, datetime.now().strftime("%Y-%m-%d %H:%M")])
+        load_covered_names.clear()
+        return True
+    except Exception:
+        return False
+
+
+def mark_multiple_covered_in_sheet(names):
+    """Batch-mark multiple players in 2 API calls total (1 fetch + 1 append) instead of 2N."""
+    ws = get_covered_worksheet()
+    if ws is None:
+        return 0
+    try:
+        existing = {r.get("name") for r in ws.get_all_records()}
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        new_rows = []
+        for name in names:
+            if name and name not in existing:
+                new_rows.append([name, ts])
+                existing.add(name)
+        if new_rows:
+            ws.append_rows(new_rows)
+        load_covered_names.clear()
+        return len(new_rows)
+    except Exception:
+        return 0
+
+
+def unmark_covered_in_sheet(name):
+    ws = get_covered_worksheet()
+    if ws is None:
+        return False
+    try:
+        records = ws.get_all_records()
+        for i, r in enumerate(records, start=2):
+            if r.get("name") == name:
+                ws.delete_rows(i)
+                load_covered_names.clear()
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def get_covered_set():
+    """Source of truth for covered names — Sheet if configured, session fallback otherwise."""
+    if get_covered_worksheet() is not None:
+        return load_covered_names()
+    return st.session_state.get("covered_fallback", set())
+
+
+def mark_player_covered(name):
+    if get_covered_worksheet() is not None:
+        mark_covered_in_sheet(name)
+    else:
+        st.session_state.setdefault("covered_fallback", set()).add(name)
+
+
+def unmark_player_covered(name):
+    if get_covered_worksheet() is not None:
+        unmark_covered_in_sheet(name)
+    else:
+        st.session_state.get("covered_fallback", set()).discard(name)
 
 
 def get_combined_pools():
@@ -539,12 +695,17 @@ def clean_player_input(raw):
 
 
 def get_category_for(name, pools):
-    """Accent-tolerant category lookup."""
+    """Accent-tolerant category lookup. Slow path — for fast bulk use, build a lookup dict instead."""
     target = normalize_name(name)
     for cat, names in pools.items():
         if any(normalize_name(n) == target for n in names):
             return cat
     return "Custom"
+
+
+def build_category_lookup(pools):
+    """Pre-build a normalized-name → category dict. O(N) once instead of O(N) per lookup."""
+    return {normalize_name(n): cat for cat, names in pools.items() for n in names}
 
 
 # ============================================================
@@ -567,6 +728,7 @@ WIKI_PRESETS = {
 }
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
 def fetch_wikipedia_category(category_title, limit=200):
     """
     Fetch member articles of a Wikipedia category.
@@ -604,6 +766,7 @@ def fetch_wikipedia_category(category_title, limit=200):
 # NEWS-DRIVEN DISCOVERY (Option B)
 # ============================================================
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_soccer_news(serpapi_key, query="soccer transfer breakout player 2026"):
     """Search Google News via SerpAPI for soccer headlines."""
     try:
@@ -628,6 +791,7 @@ def fetch_soccer_news(serpapi_key, query="soccer transfer breakout player 2026")
         return []
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_totw_articles(serpapi_key, time_window="this week"):
     """
     Search Google for recent TOTW (Team of the Week) articles via SerpAPI.
@@ -700,10 +864,10 @@ def extract_players_from_headlines(headlines, anthropic_api_key):
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_youtube_signals(player_name, api_key, _cache_version=2):
+def fetch_youtube_signals(player_name, api_key, _cache_version=SCORING_VERSION):
     """
-    _cache_version is bumped whenever the search query or scoring logic changes,
-    to invalidate cached results from older versions.
+    _cache_version is built from threshold + scoring constants. Changing any of
+    them auto-invalidates the cache on next call.
     """
     empty_result = {
         "gap_score": 10, "comp_count": 0, "comp_total_views": 0,
@@ -856,6 +1020,30 @@ def fetch_youtube_signals(player_name, api_key, _cache_version=2):
         return error_result
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_serpapi_quota(serpapi_key):
+    """
+    Fetch SerpAPI account usage. Returns (used, left, total) or (None, None, None) on error.
+    The /account endpoint itself does NOT count against search quota.
+    Cached for 5 min to avoid hammering the endpoint.
+    """
+    if not serpapi_key:
+        return None, None, None
+    try:
+        response = requests.get(
+            "https://serpapi.com/account",
+            params={"api_key": serpapi_key},
+            timeout=5,
+        )
+        response.raise_for_status()
+        data = response.json()
+        used = data.get("total_searches_used_this_month", 0)
+        left = data.get("total_searches_left", 0)
+        return used, left, used + left
+    except Exception:
+        return None, None, None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_google_trends(player_name, serpapi_key):
     if not serpapi_key:
@@ -940,9 +1128,10 @@ def generate_reason(name, scores, category=None, runner_up=None):
 
 
 def suggest_players(pools, num_icons, num_rising, num_active, exclude):
-    icons = [p for p in pools["Iconic retired"] if p not in exclude]
-    rising = [p for p in pools["Rising star"] if p not in exclude]
-    active = [p for p in pools["Active star"] if p not in exclude]
+    norm_exclude = {normalize_name(e) for e in exclude}
+    icons = [p for p in pools["Iconic retired"] if normalize_name(p) not in norm_exclude]
+    rising = [p for p in pools["Rising star"] if normalize_name(p) not in norm_exclude]
+    active = [p for p in pools["Active star"] if normalize_name(p) not in norm_exclude]
     selection = []
     selection += random.sample(icons, min(num_icons, len(icons)))
     selection += random.sample(rising, min(num_rising, len(rising)))
@@ -971,8 +1160,6 @@ sheets_configured = get_sheet() is not None
 if not serpapi_key:
     st.warning("SerpAPI key not set. Google Trends will default to 5. Sign up free at serpapi.com.")
 
-if "covered" not in st.session_state:
-    st.session_state["covered"] = set()
 if "pending_news_players" not in st.session_state:
     st.session_state["pending_news_players"] = []
 if "pending_totw_players" not in st.session_state:
@@ -995,6 +1182,19 @@ with st.sidebar:
         st.warning("Google Sheets not configured. Additions won't persist. See `GOOGLE_SHEETS_SETUP.md` to enable.")
     else:
         st.success(f"☁ Synced to Sheet ({len(sheet_players)} custom additions)")
+
+    # === SerpAPI quota status ===
+    if serpapi_key:
+        quota_used, quota_left, quota_total = get_serpapi_quota(serpapi_key)
+        if quota_used is not None and quota_total:
+            pct = quota_used / quota_total * 100
+            quota_msg = f"SerpAPI: {quota_used}/{quota_total} used this month ({pct:.0f}%)"
+            if pct >= 90:
+                st.error(f"⚠ {quota_msg} — analyses may fail soon")
+            elif pct >= 70:
+                st.warning(f"⚠ {quota_msg}")
+            else:
+                st.caption(f"☁ {quota_msg}")
 
     st.divider()
 
@@ -1267,7 +1467,19 @@ analyze_clicked = False
 
 if mode == "🎲 Suggest players for me":
     st.markdown('<div class="section-label" style="margin-top:1rem;">Player mix</div>', unsafe_allow_html=True)
-    st.caption(f"Sampling from your pool of {total} players. Icons benefit from World Cup tailwind. Rising stars ride FC Mobile / news spikes.")
+    covered_count = len(get_covered_set())
+    eligible = total - covered_count
+    if covered_count:
+        st.caption(
+            f"Sampling from **{eligible} eligible players** "
+            f"({total} total in pool, {covered_count} already marked covered). "
+            "Icons benefit from World Cup tailwind. Rising stars ride FC Mobile / news spikes."
+        )
+    else:
+        st.caption(
+            f"Sampling from your pool of {total} players. "
+            "Icons benefit from World Cup tailwind. Rising stars ride FC Mobile / news spikes."
+        )
 
     c1, c2, c3 = st.columns(3)
     with c1: num_icons = st.number_input("Iconic retired", 0, 10, 2)
@@ -1284,7 +1496,7 @@ if mode == "🎲 Suggest players for me":
     if analyze_clicked:
         players_to_analyze = suggest_players(
             pools, num_icons, num_rising, num_active,
-            exclude=st.session_state["covered"],
+            exclude=get_covered_set(),
         )
 else:
     st.markdown('<div class="section-label" style="margin-top:1rem;">Players to analyze</div>', unsafe_allow_html=True)
@@ -1307,6 +1519,7 @@ if analyze_clicked and players_to_analyze:
 
     results = []
     progress = st.progress(0, text="Starting analysis...")
+    category_lookup = build_category_lookup(pools)  # O(N) once vs O(N) per player
 
     for i, name in enumerate(players_to_analyze):
         progress.progress(i / len(players_to_analyze), text=f"Analyzing {name}...")
@@ -1321,7 +1534,7 @@ if analyze_clicked and players_to_analyze:
             "contentFreshness": yt["freshness_score"],
         }
         results.append({
-            "name": name, "category": get_category_for(name, pools),
+            "name": name, "category": category_lookup.get(normalize_name(name), "Custom"),
             "scores": scores,
             "raw": {
                 "comp_count": yt["comp_count"],
@@ -1350,6 +1563,11 @@ if "results" in st.session_state:
     winner = ranked[0]
     runner_up = ranked[1] if len(ranked) > 1 else None
 
+    # Pre-compute covered set + normalized version once per render (used by winner button + result loop)
+    covered_now = get_covered_set()
+    covered_now_norm = {normalize_name(c) for c in covered_now}
+    winner_covered = normalize_name(winner["name"]) in covered_now_norm
+
     badge = category_badge_html(winner["category"])
     reason_text = generate_reason(winner["name"], winner["scores"], winner["category"], runner_up)
     st.markdown(f"""
@@ -1368,16 +1586,45 @@ if "results" in st.session_state:
     with c1:
         st.caption(f"Analyzed at {st.session_state.get('analyzed_at', 'unknown')}")
     with c2:
-        if st.button("✓ Mark as covered", use_container_width=True):
-            st.session_state["covered"].add(winner["name"])
-            st.rerun()
+        if winner_covered:
+            if st.button("↺ Uncover (already covered)", use_container_width=True,
+                         key="winner_uncover_btn"):
+                unmark_player_covered(winner["name"])
+                st.rerun()
+        else:
+            if st.button("✓ Mark as covered", use_container_width=True,
+                         key="winner_cover_btn"):
+                mark_player_covered(winner["name"])
+                st.rerun()
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown('<div class="section-label">All candidates</div>', unsafe_allow_html=True)
 
+    # === Bulk mark-covered control ===
+    uncovered_candidates = [r["name"] for r in ranked if normalize_name(r["name"]) not in covered_now_norm]
+    if uncovered_candidates:
+        bulk_selected = st.multiselect(
+            "Bulk mark as covered (optional)",
+            options=uncovered_candidates,
+            key="bulk_cover_picker",
+            help="Select multiple candidates to mark as covered in one click.",
+        )
+        if bulk_selected:
+            if st.button(f"✓ Mark {len(bulk_selected)} as covered",
+                         key="bulk_cover_apply", use_container_width=True):
+                if get_covered_worksheet() is not None:
+                    mark_multiple_covered_in_sheet(bulk_selected)
+                else:
+                    fallback = st.session_state.setdefault("covered_fallback", set())
+                    for name_to_mark in bulk_selected:
+                        fallback.add(name_to_mark)
+                st.rerun()
+
     for i, r in enumerate(ranked):
         badge = category_badge_html(r["category"])
-        header_text = f"#{i + 1}  ·  {r['name']}  ·  {r['total']:.1f}/10"
+        is_covered = normalize_name(r["name"]) in covered_now_norm
+        covered_marker = "  ·  ✓ COVERED" if is_covered else ""
+        header_text = f"#{i + 1}  ·  {r['name']}  ·  {r['total']:.1f}/10{covered_marker}"
         with st.expander(header_text):
             st.markdown(badge, unsafe_allow_html=True)
             st.markdown("<br>", unsafe_allow_html=True)
@@ -1438,12 +1685,41 @@ if "results" in st.session_state:
             elif r["raw"]["comp_count"] == 0:
                 st.success("✨ No substantial competitors found — wide-open lane.")
 
-    if st.session_state["covered"]:
+            # Mark / Uncover toggle per result
+            st.markdown("<br>", unsafe_allow_html=True)
+            already_covered = normalize_name(r["name"]) in covered_now_norm
+            if already_covered:
+                if st.button(f"↺ Uncover {r['name']}", key=f"uncov_{r['name']}_{i}",
+                             use_container_width=True):
+                    unmark_player_covered(r["name"])
+                    st.rerun()
+            else:
+                if st.button(f"✓ Mark {r['name']} as covered", key=f"cov_{r['name']}_{i}",
+                             use_container_width=True):
+                    mark_player_covered(r["name"])
+                    st.rerun()
+
+    if covered_now:
         st.markdown("<br>", unsafe_allow_html=True)
-        with st.expander(f"Covered players  ·  {len(st.session_state['covered'])} excluded from suggestions"):
-            st.write(", ".join(sorted(st.session_state["covered"])))
-            if st.button("Clear covered list"):
-                st.session_state["covered"] = set()
+        with st.expander(f"Covered players  ·  {len(covered_now)} excluded from suggestions"):
+            st.caption("Click ✕ next to a name to un-cover (returns them to the suggestion pool).")
+            # Display in a grid of 3 columns for readability
+            covered_list = sorted(covered_now)
+            for chunk_start in range(0, len(covered_list), 3):
+                cols = st.columns(3)
+                for ci, name in enumerate(covered_list[chunk_start:chunk_start + 3]):
+                    with cols[ci]:
+                        col_name, col_btn = st.columns([4, 1])
+                        with col_name:
+                            st.caption(name)
+                        with col_btn:
+                            if st.button("✕", key=f"uncover_{name}", help=f"Un-cover {name}"):
+                                unmark_player_covered(name)
+                                st.rerun()
+            st.divider()
+            if st.button("Clear all covered", key="clear_all_covered"):
+                for name in list(covered_now):
+                    unmark_player_covered(name)
                 st.rerun()
 
     st.markdown("<br>", unsafe_allow_html=True)
