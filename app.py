@@ -700,7 +700,11 @@ def extract_players_from_headlines(headlines, anthropic_api_key):
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_youtube_signals(player_name, api_key):
+def fetch_youtube_signals(player_name, api_key, _cache_version=2):
+    """
+    _cache_version is bumped whenever the search query or scoring logic changes,
+    to invalidate cached results from older versions.
+    """
     empty_result = {
         "gap_score": 10, "comp_count": 0, "comp_total_views": 0,
         "top_competitors": [], "demand_score": 1, "total_views_top10": 0,
@@ -715,7 +719,9 @@ def fetch_youtube_signals(player_name, api_key):
     }
     try:
         youtube = build("youtube", "v3", developerKey=api_key)
-        query = f'"{player_name}"'
+        # Quoted exact-name requirement + sport disambiguators to defeat namespace collisions.
+        # Example: '"Marta" soccer football' excludes Knives Out / songs / Saint Martha results.
+        query = f'"{player_name}" soccer football'
         search = youtube.search().list(
             q=query, part="snippet", maxResults=50,
             type="video", order="viewCount",
@@ -1478,7 +1484,7 @@ st.markdown(
 Pulls the last 30 days of Google search interest. Compares the most recent third of the window to the earliest third to detect rising or falling momentum. The highest single weight because rising search interest is the leading indicator of upcoming demand.
 
 **Content gap — 20% weight — auto-scored from YouTube**
-Searches YouTube for the player's exact name and identifies substantial competitors (3+ min, 50k+ views). Gap score averages two factors: count of competitors and total combined views (how dominant they are). Two videos with 80k combined views is barely competition; two with 5M is real dominance.
+Searches YouTube with `"player name" soccer football` — the quoted exact name must appear in the video, with soccer/football terms boosting ranking to defeat namespace collisions (e.g. "Marta" the movie character vs the Brazilian footballer; "Diego Luna" the actor vs the USMNT midfielder). Identifies substantial competitors (3+ min, 50k+ views). Gap score averages two factors: count of competitors and total combined views (how dominant they are). Two videos with 80k combined views is barely competition; two with 5M is real dominance.
 
 **YT demand — 20% weight — auto-scored from YouTube**
 Combines two signals weighted 65/35:
